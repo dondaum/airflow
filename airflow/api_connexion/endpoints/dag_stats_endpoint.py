@@ -19,13 +19,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from flask import g
-from sqlalchemy import func, select
+from sqlalchemy import func, select, case
 
 from airflow.api_connexion import security
 from airflow.api_connexion.schemas.dag_stats_schema import (
     dag_stats_collection_schema,
 )
 from airflow.auth.managers.models.resource_details import DagAccessEntity
+from airflow.api_connexion.parameters import check_limit, format_parameters
 from airflow.models.dag import DagRun
 from airflow.utils.session import NEW_SESSION, provide_session
 from airflow.utils.state import DagRunState
@@ -38,25 +39,35 @@ if TYPE_CHECKING:
 
 
 @security.requires_access_dag("GET", DagAccessEntity.RUN)
+@format_parameters({"limit": check_limit})
 @provide_session
-def get_dag_stats(*, dag_ids: str, session: Session = NEW_SESSION) -> APIResponse:
+def get_dag_stats(*, dag_ids: str | None = None, offset: int | None = None, limit: int | None = None, session: Session = NEW_SESSION) -> APIResponse:
     """Get Dag statistics."""
     allowed_dag_ids = get_auth_manager().get_permitted_dag_ids(methods=["GET"], user=g.user)
-    dags_list = set(dag_ids.split(","))
-    filter_dag_ids = dags_list.intersection(allowed_dag_ids)
+    if dag_ids:
+        dags_list = set(dag_ids.split(","))
+        filter_dag_ids = dags_list.intersection(allowed_dag_ids)
+    else:
+        filter_dag_ids = allowed_dag_ids
 
     query = (
-        select(DagRun.dag_id, DagRun.state, func.count(DagRun.state))
-        .group_by(DagRun.dag_id, DagRun.state)
+        select(
+            DagRun.dag_id,
+            *[func.sum(case([
+                (DagRun.state == state, 1),
+            ], else_= 0)).label(state) for state in DagRunState
+            ]
+        )
+        .group_by(DagRun.dag_id)
         .where(DagRun.dag_id.in_(filter_dag_ids))
+        .order_by(DagRun.dag_id)
     )
-    dag_state_stats = session.execute(query)
 
-    dag_state_data = {(dag_id, state): count for dag_id, state, count in dag_state_stats}
-    dag_stats = {
-        dag_id: [{"state": state, "count": dag_state_data.get((dag_id, state), 0)} for state in DagRunState]
-        for dag_id in filter_dag_ids
-    }
+    dag_state_stats = session.execute(query.offset(offset).limit(limit)).all()
 
+    dag_state_data = [row._asdict() for row in dag_state_stats]
+    dag_stats = {}
+    for dag in dag_state_data:
+        dag_stats[dag["dag_id"]] = [{"state": state, "count": dag[state]} for state in DagRunState]
     dags = [{"dag_id": stat, "stats": dag_stats[stat]} for stat in dag_stats]
-    return dag_stats_collection_schema.dump({"dags": dags, "total_entries": len(dag_stats)})
+    return dag_stats_collection_schema.dump({"dags": dags, "total_entries": len(filter_dag_ids)})

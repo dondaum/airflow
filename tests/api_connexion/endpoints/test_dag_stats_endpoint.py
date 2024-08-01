@@ -80,10 +80,10 @@ class TestDagStatsEndpoint:
         self.app.dag_bag.bag_dag(dag, root_dag=dag)
         return dag_instance
 
-    def test_should_respond_200(self, session):
-        self._create_dag("dag_stats_dag")
-        self._create_dag("dag_stats_dag_2")
-        dag_1_run_1 = DagRun(
+    def _create_dag_runs(self):
+       self._create_dag("dag_stats_dag")
+       self._create_dag("dag_stats_dag_2")
+       dag_1_run_1 = DagRun(
             dag_id="dag_stats_dag",
             run_id="test_dag_run_id_1",
             run_type=DagRunType.MANUAL,
@@ -91,8 +91,8 @@ class TestDagStatsEndpoint:
             start_date=timezone.parse(self.default_time),
             external_trigger=True,
             state="running",
-        )
-        dag_1_run_2 = DagRun(
+       )
+       dag_1_run_2 = DagRun(
             dag_id="dag_stats_dag",
             run_id="test_dag_run_id_2",
             run_type=DagRunType.MANUAL,
@@ -100,8 +100,8 @@ class TestDagStatsEndpoint:
             start_date=timezone.parse(self.default_time),
             external_trigger=True,
             state="failed",
-        )
-        dag_2_run_1 = DagRun(
+       )
+       dag_2_run_1 = DagRun(
             dag_id="dag_stats_dag_2",
             run_id="test_dag_2_run_id_1",
             run_type=DagRunType.MANUAL,
@@ -110,7 +110,10 @@ class TestDagStatsEndpoint:
             external_trigger=True,
             state="queued",
         )
-        session.add_all((dag_1_run_1, dag_1_run_2, dag_2_run_1))
+       return dag_1_run_1, dag_1_run_2, dag_2_run_1
+
+    def test_should_respond_200_with_dag_filter(self, session):
+        session.add_all(self._create_dag_runs())
         session.commit()
         exp_payload = {
             "dags": [
@@ -169,7 +172,17 @@ class TestDagStatsEndpoint:
         assert sorted(response.json["dags"], key=lambda d: d["dag_id"]) == sorted(
             exp_payload["dags"], key=lambda d: d["dag_id"]
         )
-        response.json["total_entries"] == 2
+        assert response.json["total_entries"] == 2
+
+    def test_should_respond_200_no_filter(self, session):
+        session.add_all(self._create_dag_runs())
+        session.commit()
+        response = self.client.get(
+            "api/v1/dagStats", environ_overrides={"REMOTE_USER": "test"}
+        )
+        assert response.status_code == 200
+        assert len(response.json["dags"]) == 2
+        assert response.json["total_entries"] == 2
 
     def test_should_raises_401_unauthenticated(self):
         dag_ids = "dag_stats_dag,dag_stats_dag_2"
@@ -184,3 +197,41 @@ class TestDagStatsEndpoint:
             f"api/v1/dagStats?dag_ids={dag_ids}", environ_overrides={"REMOTE_USER": "test_no_permissions"}
         )
         assert response.status_code == 403
+
+
+class TestDagStatsEndpointPagination(TestDagStatsEndpoint):
+    @pytest.mark.parametrize(
+        "url, expected_dag_ids",
+        [
+            # Limit test data
+            ("api/v1/dagStats?limit=1", ["dag_stats_dag"]),
+            (
+                "api/v1/dagStats?limit=2",
+                ["dag_stats_dag", "dag_stats_dag_2"],
+            ),
+            # # Offset test data
+            # (
+            #     "/api/v1/datasets/events?offset=1&order_by=source_run_id",
+            #     [f"run{i}" for i in range(2, 10)],
+            # ),
+            # (
+            #     "/api/v1/datasets/events?offset=3&order_by=source_run_id",
+            #     [f"run{i}" for i in range(4, 10)],
+            # ),
+            # # Limit and offset test data
+            # (
+            #     "/api/v1/datasets/events?offset=3&limit=3&order_by=source_run_id",
+            #     [f"run{i}" for i in [4, 5, 6]],
+            # ),
+        ],
+    )
+    def test_limit_and_offset(self, url, expected_dag_ids, session):
+        session.add_all(self._create_dag_runs())
+        session.commit()
+        response = self.client.get(
+            url, environ_overrides={"REMOTE_USER": "test"}
+        )
+        assert response.status_code == 200
+        assert response.json["total_entries"] == 2
+        dag_ids = [dag["dag_id"] for dag in response.json["dags"]]
+        assert sorted(dag_ids) == sorted(expected_dag_ids)
