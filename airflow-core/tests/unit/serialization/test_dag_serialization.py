@@ -62,11 +62,13 @@ from airflow.models.connection import Connection
 from airflow.models.taskinstance import TaskInstance as TI
 from airflow.models.xcom import XCOM_RETURN_KEY, XComModel
 from airflow.providers.cncf.kubernetes.pod_generator import PodGenerator
+from airflow.models.callback import ImportPathCallbackDefProtocol
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.sdk import DAG, Asset, AssetAlias, BaseHook, TaskGroup, WeightRule, XComArg, teardown
 from airflow.sdk.bases.decorator import DecoratedOperator
 from airflow.sdk.bases.operator import OPERATOR_DEFAULTS, BaseOperator
 from airflow.sdk.definitions._internal.expandinput import EXPAND_INPUT_EMPTY
+from airflow.sdk.definitions.callback import SyncCallback
 from airflow.sdk.definitions.operator_resources import Resources
 from airflow.sdk.definitions.param import Param, ParamsDict
 from airflow.security import permissions
@@ -352,6 +354,10 @@ CUSTOM_TIMETABLE_SERIALIZED = {
     "__type": "tests_common.test_utils.timetables.CustomSerializationTimetable",
     "__var": {"value": "foo"},
 }
+
+
+CALLBACK_TYPES = ("execute", "failure", "success", "retry", "skipped")
+OPERATOR_CALLBACK_FIELDS = frozenset(f"on_{x}_callback" for x in CALLBACK_TYPES)
 
 
 @pytest.fixture
@@ -775,6 +781,29 @@ class TestStringifiedDAGs:
         # Let's not be exact about this, but if everything fails to parse we should fail this test too
         assert len(dags) >= 7
 
+    @skip_if_force_lowest_dependencies_marker
+    @pytest.mark.db_test
+    @conf_vars(
+        {
+            ("dag_processor", "run_callbacks"): "False",
+        }
+    )
+    def test_roundtrip_provider_example_dags_with_executor_callbacks(self):
+        dags, _ = collect_dags(
+            [
+                "providers/*/src/airflow/providers/*/example_dags",
+                "providers/*/src/airflow/providers/*/*/example_dags",
+            ]
+        )
+
+        # Verify deserialized DAGs.
+        for dag in dags.values():
+            serialized_dag = DagSerialization.from_json(DagSerialization.to_json(dag))
+            self.validate_deserialized_dag(serialized_dag, dag)
+
+        # Let's not be exact about this, but if everything fails to parse we should fail this test too
+        assert len(dags) >= 7
+
     @pytest.mark.db_test
     @pytest.mark.parametrize(
         "timetable",
@@ -840,6 +869,7 @@ class TestStringifiedDAGs:
         task,
     ):
         """Verify non-Airflow operators are casted to BaseOperator or MappedOperator."""
+        from airflow.configuration import conf
         from airflow.sdk import BaseOperator
         from airflow.sdk.definitions.mappedoperator import MappedOperator
 
@@ -875,6 +905,8 @@ class TestStringifiedDAGs:
                 # Only needed at execution time; intentionally excluded
                 "returns_dag_result",
             }
+            # callbacks fields are checked separately
+            fields_to_check -= OPERATOR_CALLBACK_FIELDS
         else:  # Promised to be mapped by the assert above.
             assert isinstance(serialized_task, SerializedMappedOperator)
             fields_to_check = {f.name for f in attrs.fields(MappedOperator)}
@@ -897,6 +929,8 @@ class TestStringifiedDAGs:
                 "expand_input",
                 "weight_rule",
             }
+            # callbacks fields are checked separately
+            fields_to_check -= OPERATOR_CALLBACK_FIELDS
 
         assert serialized_task.task_type == task.task_type
 
@@ -986,6 +1020,20 @@ class TestStringifiedDAGs:
             sdk_expand_input_data = attrs.asdict(task._get_specified_expand_input())
             with mock.patch.object(SerializedBaseOperator, "__eq__", _operator_equal):
                 assert ser_expand_input_data == sdk_expand_input_data
+
+        if conf.getboolean("dag_processor", "run_callbacks"):
+            for callback_field in OPERATOR_CALLBACK_FIELDS:
+                # Serialized callbacks should be empty list if they run on the Dag processor
+                assert getattr(serialized_task, callback_field) == []
+                # Actual task callbacks should be a list of callables if they run on the Dag processor
+                assert all(callable(cb) for cb in getattr(task, callback_field))
+        else:
+            for callback_field in OPERATOR_CALLBACK_FIELDS:
+                ser_callbacks = getattr(serialized_task, callback_field)
+                task_callbacks_path = [cb.path for cb in getattr(task, callback_field)]
+                serialized_callbacks_path = [cb.path for cb in getattr(serialized_task, callback_field)]
+                assert all(isinstance(cb, ImportPathCallbackDefProtocol) for cb in ser_callbacks)
+                assert sorted(task_callbacks_path) == sorted(serialized_callbacks_path)
 
     @pytest.mark.parametrize(
         ("dag_start_date", "task_start_date", "expected_task_start_date"),
@@ -1572,6 +1620,8 @@ class TestStringifiedDAGs:
             "tasks",
             "has_on_success_callback",
             "has_on_failure_callback",
+            "on_success_callback",
+            "on_failure_callback",
             "dag_dependencies",
             "params",
         }
@@ -1680,6 +1730,11 @@ class TestStringifiedDAGs:
             "wait_for_past_depends_before_skipping": False,
             "weight_rule": WeightRule.DOWNSTREAM,
             "multiple_outputs": False,
+            "on_execute_callback": [],
+            "on_failure_callback": [],
+            "on_retry_callback": [],
+            "on_skipped_callback": [],
+            "on_success_callback": [],
         }, """
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
@@ -4390,6 +4445,173 @@ def dummy_callback():
 
 
 @pytest.mark.parametrize(
+    ("callback_config", "expected_flags", "is_mapped", "use_executor_callback"),
+    [
+        # Regular operator tests
+        (
+            {
+                "on_failure_callback": dummy_callback,
+                "on_retry_callback": [dummy_callback, dummy_callback],
+                "on_success_callback": dummy_callback,
+            },
+            {"has_on_failure_callback": True, "has_on_retry_callback": True, "has_on_success_callback": True},
+            False,
+            False,
+        ),
+        (
+            {},  # No callbacks
+            {
+                "has_on_failure_callback": False,
+                "has_on_retry_callback": False,
+                "has_on_success_callback": False,
+            },
+            False,
+            False,
+        ),
+        (
+            {"on_failure_callback": [], "on_success_callback": None},  # Empty callbacks
+            {"has_on_failure_callback": False, "has_on_success_callback": False},
+            False,
+            False,
+        ),
+        # Mapped operator tests
+        (
+            {"on_failure_callback": dummy_callback, "on_success_callback": [dummy_callback, dummy_callback]},
+            {"has_on_failure_callback": True, "has_on_success_callback": True},
+            True,
+            False,
+        ),
+        (
+            {},  # Mapped operator without callbacks
+            {"has_on_failure_callback": False, "has_on_success_callback": False},
+            True,
+            False,
+        ),
+        # Regular operator tests with executor callbacks
+        (
+            {
+                "on_failure_callback": dummy_callback,
+                "on_retry_callback": [dummy_callback, dummy_callback],
+                "on_success_callback": dummy_callback,
+            },
+            {"has_on_failure_callback": True, "has_on_retry_callback": True, "has_on_success_callback": True},
+            False,
+            True,
+        ),
+        (
+            {},  # No callbacks with executor callbacks
+            {
+                "has_on_failure_callback": False,
+                "has_on_retry_callback": False,
+                "has_on_success_callback": False,
+            },
+            False,
+            True,
+        ),
+        (
+            {
+                "on_failure_callback": [],
+                "on_success_callback": None,
+            },  # Empty callbacks with executor callbacks
+            {"has_on_failure_callback": False, "has_on_success_callback": False},
+            False,
+            True,
+        ),
+        # Mapped operator tests with executor callbacks
+        (
+            {"on_failure_callback": dummy_callback, "on_success_callback": [dummy_callback, dummy_callback]},
+            {"has_on_failure_callback": True, "has_on_success_callback": True},
+            True,
+            True,
+        ),
+        (
+            {},  # Mapped operator without callbacks with executor callbacks
+            {"has_on_failure_callback": False, "has_on_success_callback": False},
+            True,
+            True,
+        ),
+    ],
+)
+def test_task_callback_boolean_optimization(
+    callback_config, expected_flags, is_mapped, use_executor_callback
+):
+    """Test task callback boolean optimization for Dag Processor and executor callbacks."""
+    callback_config_context = (
+        conf_vars({("dag_processor", "run_callbacks"): "False"})
+        if use_executor_callback
+        else contextlib.nullcontext()
+    )
+    with callback_config_context:
+        dag = DAG(dag_id="test_callback_dag")
+
+        if is_mapped:
+            # Create mapped operator
+            task = BashOperator.partial(task_id="test_task", dag=dag, **callback_config).expand(
+                bash_command=["echo 1", "echo 2"]
+            )
+
+            serialized = BaseSerialization.serialize(task)
+            deserialized = BaseSerialization.deserialize(serialized)
+
+            # For mapped operators, check partial_kwargs
+            serialized_data = serialized.get("__var", {}).get("partial_kwargs", {})
+
+            # Test serialization
+            for flag, expected in expected_flags.items():
+                if expected:
+                    assert flag in serialized_data
+                    assert serialized_data[flag] is True
+                else:
+                    assert serialized_data.get(flag, False) is False
+
+            if use_executor_callback:
+                for callback_type in callback_config:
+                    if callback_config[callback_type]:
+                        for callback in getattr(deserialized, callback_type):
+                            assert isinstance(callback, SyncCallback)
+                    else:
+                        assert getattr(deserialized, callback_type) is None
+
+            # Test deserialized properties
+            for flag, expected in expected_flags.items():
+                assert getattr(deserialized, flag) is expected
+
+        else:
+            # Create regular operator
+            task = BashOperator(task_id="test_task", bash_command="echo test", dag=dag, **callback_config)
+
+            serialized = BaseSerialization.serialize(task)
+            deserialized = BaseSerialization.deserialize(serialized)
+
+            # For regular operators, check top-level
+            serialized_data = serialized.get("__var", {})
+
+            # Test serialization (only True values are stored)
+            for flag, expected in expected_flags.items():
+                if expected:
+                    assert serialized_data.get(flag, False) is True
+                else:
+                    assert serialized_data.get(flag, False) is False
+
+            if use_executor_callback:
+                for callback_type in callback_config:
+                    if callback_config[callback_type]:
+                        for callback in getattr(deserialized, callback_type):
+                            assert isinstance(callback, SyncCallback)
+                    else:
+                        assert getattr(deserialized, callback_type) == []
+
+            # Test deserialized properties
+            for flag, expected in expected_flags.items():
+                assert getattr(deserialized, flag) is expected
+
+
+@conf_vars(
+    {
+        ("dag_processor", "run_callbacks"): "False",
+    }
+)
+@pytest.mark.parametrize(
     ("callback_config", "expected_flags", "is_mapped"),
     [
         # Regular operator tests
@@ -4402,35 +4624,18 @@ def dummy_callback():
             {"has_on_failure_callback": True, "has_on_retry_callback": True, "has_on_success_callback": True},
             False,
         ),
-        (
-            {},  # No callbacks
-            {
-                "has_on_failure_callback": False,
-                "has_on_retry_callback": False,
-                "has_on_success_callback": False,
-            },
-            False,
-        ),
-        (
-            {"on_failure_callback": [], "on_success_callback": None},  # Empty callbacks
-            {"has_on_failure_callback": False, "has_on_success_callback": False},
-            False,
-        ),
         # Mapped operator tests
         (
             {"on_failure_callback": dummy_callback, "on_success_callback": [dummy_callback, dummy_callback]},
             {"has_on_failure_callback": True, "has_on_success_callback": True},
             True,
         ),
-        (
-            {},  # Mapped operator without callbacks
-            {"has_on_failure_callback": False, "has_on_success_callback": False},
-            True,
-        ),
     ],
 )
-def test_task_callback_boolean_optimization(callback_config, expected_flags, is_mapped):
-    """Test that task callbacks are optimized using has_on_*_callback boolean flags."""
+def test_task_callback_boolean_optimization_with_executor_callback(
+    callback_config, expected_flags, is_mapped
+):
+    """Test that task callbacks are optimized using has_on_*_callback boolean flags with executor callbacks."""
     dag = DAG(dag_id="test_callback_dag")
 
     if is_mapped:
@@ -4457,9 +4662,16 @@ def test_task_callback_boolean_optimization(callback_config, expected_flags, is_
         for flag, expected in expected_flags.items():
             assert getattr(deserialized, flag) is expected
 
+        # Test executor callback deserialization
+        for callback_type, _ in callback_config.items():
+            dag_callbacks = getattr(deserialized, callback_type)
+            for cb in dag_callbacks:
+                assert isinstance(cb, SyncCallback)
+
     else:
         # Create regular operator
         task = BashOperator(task_id="test_task", bash_command="echo test", dag=dag, **callback_config)
+        assert isinstance(task.on_failure_callback[0], SyncCallback)
 
         serialized = BaseSerialization.serialize(task)
         deserialized = BaseSerialization.deserialize(serialized)
@@ -4467,12 +4679,18 @@ def test_task_callback_boolean_optimization(callback_config, expected_flags, is_
         # For regular operators, check top-level
         serialized_data = serialized.get("__var", {})
 
-        # Test serialization (only True values are stored)
+        # Test boolean flag serialization (only True values are stored)
         for flag, expected in expected_flags.items():
             if expected:
                 assert serialized_data.get(flag, False) is True
             else:
                 assert serialized_data.get(flag, False) is False
+
+        # Test executor callback deserialization
+        for callback_type, _ in callback_config.items():
+            dag_callbacks = getattr(deserialized, callback_type)
+            for cb in dag_callbacks:
+                assert isinstance(cb, SyncCallback)
 
         # Test deserialized properties
         for flag, expected in expected_flags.items():
@@ -4600,7 +4818,6 @@ def test_task_callback_backward_compatibility(old_callback_name, new_callback_na
     # Verify the new format is present and correct
     assert hasattr(deserialized_task, new_callback_name)
     assert getattr(deserialized_task, new_callback_name) is True
-    assert not hasattr(deserialized_task, old_callback_name)
 
     # Test with empty/None callback (should convert to False)
     old_serialized_task[old_callback_name] = None

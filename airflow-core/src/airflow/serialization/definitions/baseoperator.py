@@ -37,6 +37,7 @@ from airflow.ti_deps.deps.trigger_rule_dep import TriggerRuleDep
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable, Iterator, Sequence
 
+    from airflow.models.callback import CallbackDefinitionProtocol
     from airflow.models.taskinstance import TaskInstance
     from airflow.sdk import Context
     from airflow.serialization.definitions.dag import SerializedDAG
@@ -111,6 +112,13 @@ class SerializedBaseOperator(DAGNode):
     has_on_retry_callback: bool = False
     has_on_success_callback: bool = False
     has_on_skipped_callback: bool = False
+
+    # Serialized callback definitions
+    on_execute_callback: list[CallbackDefinitionProtocol] = []
+    on_failure_callback: list[CallbackDefinitionProtocol] = []
+    on_retry_callback: list[CallbackDefinitionProtocol] = []
+    on_success_callback: list[CallbackDefinitionProtocol] = []
+    on_skipped_callback: list[CallbackDefinitionProtocol] = []
 
     operator_extra_links: Collection[XComOperatorLink] = []
     on_failure_fail_dagrun: bool = False
@@ -208,6 +216,11 @@ class SerializedBaseOperator(DAGNode):
                 "has_on_retry_callback",
                 "has_on_skipped_callback",
                 "has_on_success_callback",
+                "on_execute_callback",
+                "on_failure_callback",
+                "on_retry_callback",
+                "on_skipped_callback",
+                "on_success_callback",
                 "on_failure_fail_dagrun",
                 "outlets",
                 "owner",

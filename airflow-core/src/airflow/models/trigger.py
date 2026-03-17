@@ -28,6 +28,8 @@ from sqlalchemy import ForeignKey, Index, Integer, String, Text, delete, func, o
 from sqlalchemy.ext.associationproxy import association_proxy
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship, selectinload
 from sqlalchemy.sql.functions import coalesce
+from airflow.models.callback import Callback, persist_executor_callbacks
+from airflow.api_fastapi.execution_api.datamodels.taskinstance import TIRunContext
 
 from airflow._shared.timezones import timezone
 from airflow.assets.manager import AssetManager
@@ -674,37 +676,67 @@ def _(event: BaseTaskEndEvent, *, task_instance: TaskInstance, session: Session)
         ):
             if task_instance.dag_model.relative_fileloc is None:
                 raise RuntimeError("relative_fileloc should not be None for a finished task")
-            from airflow.models.dag_version import _resolve_version_data
+            if conf.getboolean("dag_processor", "run_callbacks"):
+                from airflow.models.dag_version import _resolve_version_data
+                # Derive bundle identity from the TI's dag_version (falling back to dag_run/dag_model
+                # for legacy/unpinned runs), mirroring the other callback sites so bundle_version and
+                # version_data always describe the same version.
+                bundle_name = (
+                    task_instance.dag_version.bundle_name
+                    if task_instance.dag_version
+                    else task_instance.dag_model.bundle_name
+                )
+                bundle_version = (
+                    task_instance.dag_version.bundle_version
+                    if task_instance.dag_version and task_instance.dag_run.bundle_version is not None
+                    else task_instance.dag_run.bundle_version
+                )
+                version_data = _resolve_version_data(
+                    task_instance.dag_version, task_instance.dag_run.bundle_version
+                )
+                request = TaskCallbackRequest(
+                    filepath=task_instance.dag_model.relative_fileloc,
+                    ti=task_instance,
+                    task_callback_type=callback_type,
+                    bundle_name=bundle_name,
+                    bundle_version=bundle_version,
+                    version_data=version_data,
+                )
+                log.info("Sending callback: %s", request)
+                try:
+                    DatabaseCallbackSink().send(callback=request, session=session)
+                except Exception:
+                    log.exception("Failed to send callback.")
+            else:
+                context = TIRunContext(
+                        dag_run=task_instance.dag_run,
+                        max_tries=task_instance.max_tries,
+                        variables=[],
+                        connections=[],
+                        xcom_keys_to_clear=[],
+                )
+                all_callbacks: list[Callback] = []
+    
+                if callback_type == TaskInstanceState.SUCCESS:
+                    task_callback_type = task_instance.task.on_success_callback
+                elif callback_type == TaskInstanceState.FAILED:
+                    task_callback_type = task_instance.task.on_failure_callback
+                elif callback_type == TaskInstanceState.UP_FOR_RETRY:
+                    task_callback_type = task_instance.task.on_retry_callback
+                else:
+                    raise ValueError(f"Unsupported callback type: {callback_type}")
 
-            # Derive bundle identity from the TI's dag_version (falling back to dag_run/dag_model
-            # for legacy/unpinned runs), mirroring the other callback sites so bundle_version and
-            # version_data always describe the same version.
-            bundle_name = (
-                task_instance.dag_version.bundle_name
-                if task_instance.dag_version
-                else task_instance.dag_model.bundle_name
-            )
-            bundle_version = (
-                task_instance.dag_version.bundle_version
-                if task_instance.dag_version and task_instance.dag_run.bundle_version is not None
-                else task_instance.dag_run.bundle_version
-            )
-            version_data = _resolve_version_data(
-                task_instance.dag_version, task_instance.dag_run.bundle_version
-            )
-            request = TaskCallbackRequest(
-                filepath=task_instance.dag_model.relative_fileloc,
-                ti=task_instance,
-                task_callback_type=callback_type,
-                bundle_name=bundle_name,
-                bundle_version=bundle_version,
-                version_data=version_data,
-            )
-            log.info("Sending callback: %s", request)
-            try:
-                DatabaseCallbackSink().send(callback=request, session=session)
-            except Exception:
-                log.exception("Failed to send callback.")
+                for callback in task_callback_type:
+                    make_callback = Callback.create_from_sdk_def(
+                        callback_def=callback,
+                        dag_id=task_instance.dag_id,
+                        dag_run_id=task_instance.run_id,
+                        # bundle_name and version are not needed as they are later
+                        # infered by the DagRun here airflow-core/src/airflow/executors/workloads/callback.py
+                    )
+                    make_callback.data["kwargs"] = {"context": context}
+                    all_callbacks.append(make_callback)
+                persist_executor_callbacks(callbacks=all_callbacks, session=session)
 
     def _push_xcoms_if_necessary() -> None:
         """Pushes XComs to the database if they are provided."""

@@ -33,7 +33,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from functools import total_ordering, wraps
 from types import FunctionType
-from typing import TYPE_CHECKING, Any, ClassVar, Final, NoReturn, TypeVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Final, NoReturn, TypeAlias, TypeVar, cast
 
 import attrs
 
@@ -62,6 +62,7 @@ from airflow.sdk.definitions._internal.decorators import fixup_decorator_warning
 from airflow.sdk.definitions._internal.node import validate_key
 from airflow.sdk.definitions._internal.setup_teardown import SetupTeardownContext
 from airflow.sdk.definitions._internal.types import NOTSET, validate_instance_args
+from airflow.sdk.definitions.callback import Callback, SyncCallback
 from airflow.sdk.definitions.edges import EdgeModifier
 from airflow.sdk.definitions.mappedoperator import OperatorPartial, validate_mapping_kwargs
 from airflow.sdk.definitions.param import ParamsDict
@@ -82,6 +83,9 @@ def db_safe_priority(priority_weight: int) -> int:
 
 C = TypeVar("C", bound=Callable)
 T = TypeVar("T", bound=FunctionType)
+
+CallbackType: TypeAlias = TaskStateChangeCallback | Callback
+
 
 if TYPE_CHECKING:
     from types import ClassMethodDescriptorType
@@ -305,11 +309,11 @@ if TYPE_CHECKING:
         map_index_template: str | None = ...,
         max_active_tis_per_dag: int | None = ...,
         max_active_tis_per_dagrun: int | None = ...,
-        on_execute_callback: None | TaskStateChangeCallback | list[TaskStateChangeCallback] = ...,
-        on_failure_callback: None | TaskStateChangeCallback | list[TaskStateChangeCallback] = ...,
-        on_success_callback: None | TaskStateChangeCallback | list[TaskStateChangeCallback] = ...,
-        on_retry_callback: None | TaskStateChangeCallback | list[TaskStateChangeCallback] = ...,
-        on_skipped_callback: None | TaskStateChangeCallback | list[TaskStateChangeCallback] = ...,
+        on_execute_callback: None | CallbackType | Collection[CallbackType] = ...,
+        on_failure_callback: None | CallbackType | Collection[CallbackType] = ...,
+        on_success_callback: None | CallbackType | Collection[CallbackType] = ...,
+        on_retry_callback: None | CallbackType | Collection[CallbackType] = ...,
+        on_skipped_callback: None | CallbackType | Collection[CallbackType] = ...,
         run_as_user: str | None = ...,
         executor: str | None = ...,
         executor_config: dict | None = ...,
@@ -394,7 +398,9 @@ else:
         )
 
         for k in ("execute", "failure", "success", "retry", "skipped"):
-            partial_kwargs[attr] = _collect_from_input(partial_kwargs.get(attr := f"on_{k}_callback"))
+            partial_kwargs[attr] = _collect_callbacks_from_input(
+                partial_kwargs.get(attr := f"on_{k}_callback")
+            )
 
         return OperatorPartial(
             operator_class=operator_class,
@@ -455,11 +461,49 @@ if "airflow.configuration" in sys.modules:
 
 
 def _collect_from_input(value_or_values: None | C | Collection[C]) -> list[C]:
+    """Collect values from the input value or values as a list."""
     if not value_or_values:
         return []
     if isinstance(value_or_values, Collection):
         return list(value_or_values)
     return [value_or_values]
+
+
+def _collect_callbacks_from_input(
+    callbacks_or_callback: None | CallbackType | Collection[CallbackType],
+) -> list[CallbackType]:
+    """Collect callback functions from the input value or values as a list."""
+    from airflow.sdk.configuration import conf
+
+    if not callbacks_or_callback:
+        return []
+
+    if not isinstance(callbacks_or_callback, Collection):
+        callbacks_list = [callbacks_or_callback]
+    else:
+        callbacks_list = list(callbacks_or_callback)
+
+    if conf.getboolean("dag_processor", "run_callbacks"):
+        # Validate all are callable
+        if not all(callable(cb) for cb in callbacks_list):
+            if any(isinstance(cb, Callback) for cb in callbacks_list):
+                raise ValueError(
+                    "Callbacks of type Callback is not allowed. Use a callable or a list of callables instead."
+                )
+            raise ValueError("All callbacks must be callables")
+        return callbacks_list
+
+    # Process callbacks when not running on dag processor
+    result: list[CallbackType] = []
+    for cb in callbacks_list:
+        if isinstance(cb, Callback):
+            result.append(cb)
+        elif callable(cb):
+            result.append(SyncCallback(callback_callable=cb, kwargs=None, executor=None))
+        else:
+            raise ValueError(f"Invalid callback type: {type(cb)}")
+
+    return result
 
 
 class BaseOperatorMeta(abc.ABCMeta):
@@ -889,11 +933,11 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
     pool: str = DEFAULT_POOL_NAME
     pool_slots: int = DEFAULT_POOL_SLOTS
     execution_timeout: timedelta | None = DEFAULT_TASK_EXECUTION_TIMEOUT
-    on_execute_callback: Sequence[TaskStateChangeCallback] = ()
-    on_failure_callback: Sequence[TaskStateChangeCallback] = ()
-    on_success_callback: Sequence[TaskStateChangeCallback] = ()
-    on_retry_callback: Sequence[TaskStateChangeCallback] = ()
-    on_skipped_callback: Sequence[TaskStateChangeCallback] = ()
+    on_execute_callback: Sequence[CallbackType] = ()
+    on_failure_callback: Sequence[CallbackType] = ()
+    on_success_callback: Sequence[CallbackType] = ()
+    on_retry_callback: Sequence[CallbackType] = ()
+    on_skipped_callback: Sequence[CallbackType] = ()
     _pre_execute_hook: TaskPreExecuteHook | None = None
     _post_execute_hook: TaskPostExecuteHook | None = None
     trigger_rule: TriggerRule = DEFAULT_TRIGGER_RULE
@@ -1055,11 +1099,11 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
         pool_slots: int = DEFAULT_POOL_SLOTS,
         sla: timedelta | None = None,
         execution_timeout: timedelta | None = DEFAULT_TASK_EXECUTION_TIMEOUT,
-        on_execute_callback: None | TaskStateChangeCallback | Collection[TaskStateChangeCallback] = None,
-        on_failure_callback: None | TaskStateChangeCallback | list[TaskStateChangeCallback] = None,
-        on_success_callback: None | TaskStateChangeCallback | Collection[TaskStateChangeCallback] = None,
-        on_retry_callback: None | TaskStateChangeCallback | list[TaskStateChangeCallback] = None,
-        on_skipped_callback: None | TaskStateChangeCallback | Collection[TaskStateChangeCallback] = None,
+        on_execute_callback: None | CallbackType | Collection[CallbackType] = None,
+        on_failure_callback: None | CallbackType | Collection[CallbackType] = None,
+        on_success_callback: None | CallbackType | Collection[CallbackType] = None,
+        on_retry_callback: None | CallbackType | Collection[CallbackType] = None,
+        on_skipped_callback: None | CallbackType | Collection[CallbackType] = None,
         pre_execute: TaskPreExecuteHook | None = None,
         post_execute: TaskPostExecuteHook | None = None,
         trigger_rule: str = DEFAULT_TRIGGER_RULE,
@@ -1137,11 +1181,11 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
             )
         self.execution_timeout = execution_timeout
 
-        self.on_execute_callback = _collect_from_input(on_execute_callback)
-        self.on_failure_callback = _collect_from_input(on_failure_callback)
-        self.on_success_callback = _collect_from_input(on_success_callback)
-        self.on_retry_callback = _collect_from_input(on_retry_callback)
-        self.on_skipped_callback = _collect_from_input(on_skipped_callback)
+        self.on_execute_callback = _collect_callbacks_from_input(on_execute_callback)
+        self.on_failure_callback = _collect_callbacks_from_input(on_failure_callback)
+        self.on_success_callback = _collect_callbacks_from_input(on_success_callback)
+        self.on_retry_callback = _collect_callbacks_from_input(on_retry_callback)
+        self.on_skipped_callback = _collect_callbacks_from_input(on_skipped_callback)
         self._pre_execute_hook = pre_execute
         self._post_execute_hook = post_execute
 
@@ -1546,11 +1590,6 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
                     "task_group",
                     "_task_type",
                     "operator_extra_links",
-                    "on_execute_callback",
-                    "on_failure_callback",
-                    "on_success_callback",
-                    "on_retry_callback",
-                    "on_skipped_callback",
                     "retry_policy",
                 }
                 | {  # Class level defaults, or `@property` need to be added to this list

@@ -4926,6 +4926,66 @@ class TestTaskRunnerCallsListeners:
         assert listener.error == error
 
 
+_module_callback_test_results: list[str] = []
+_module_success_data: dict[str, Any] = {}
+_module_failure_data: dict[str, Any] = {}
+
+
+def _success_module_callback_context_test(context):
+    ti = context["task_instance"]
+    _module_success_data["end_date"] = ti.end_date
+    _module_success_data["start_date"] = ti.start_date
+    _module_success_data["duration"] = (ti.end_date - ti.start_date).total_seconds() if ti.end_date else None
+
+
+def _failure_module_callback_context_test(context):
+    ti = context["task_instance"]
+    _module_failure_data["end_date"] = ti.end_date
+    _module_failure_data["start_date"] = ti.start_date
+    _module_failure_data["duration"] = (ti.end_date - ti.start_date).total_seconds() if ti.end_date else None
+
+
+def _reset_module_callback_context_tests():
+    """Helper to clear results between tests."""
+    _module_success_data.clear()
+    _module_failure_data.clear()
+
+
+def _reset_module_callback_test_results():
+    """Helper to clear results between tests."""
+    _module_callback_test_results.clear()
+
+
+def _custom_module_callback(context, *, kind):
+    """Module-level callback that can be imported."""
+    _module_callback_test_results.append(f"on-{kind} callback")
+
+
+def _failure_module_callback(context):
+    """Module-level failure callback."""
+    _custom_module_callback(context, kind="failure")
+
+
+def _execute_module_callback(context):
+    """Module-level execute callback"""
+    _custom_module_callback(context, kind="execute")
+
+
+def _skipped_module_callback(context):
+    """Module-level skipped callback"""
+    _custom_module_callback(context, kind="skipped")
+
+
+def _success_module_callback(context):
+    """Module-level success callback"""
+    _custom_module_callback(context, kind="success")
+
+
+def _retry_module_callback(context):
+    """Module-level retry callback"""
+    _custom_module_callback(context, kind="retry")
+
+
 @pytest.mark.usefixtures("mock_supervisor_comms")
 class TestTaskRunnerCallsCallbacks:
     class _Failure(Exception):
@@ -4977,6 +5037,7 @@ class TestTaskRunnerCallsCallbacks:
             ),
         ],
     )
+    @pytest.mark.parametrize("use_executor_callback", [False, True], ids=["dag-processor", "executor"])
     def test_task_runner_calls_callback(
         self,
         create_runtime_ti,
@@ -4984,36 +5045,55 @@ class TestTaskRunnerCallsCallbacks:
         should_retry,
         expected_state,
         expected_results,
+        use_executor_callback,
     ):
-        collected_results = []
+        if use_executor_callback:
+            _reset_module_callback_test_results()
+            results = _module_callback_test_results
+            callbacks = {
+                "on_execute_callback": _execute_module_callback,
+                "on_skipped_callback": _skipped_module_callback,
+                "on_success_callback": _success_module_callback,
+                "on_failure_callback": _failure_module_callback,
+                "on_retry_callback": _retry_module_callback,
+            }
+            config = {("dag_processor", "run_callbacks"): "False"}
+        else:
+            results = []
 
-        def custom_callback(context, *, kind):
-            collected_results.append(f"on-{kind} callback")
+            def custom_callback(context, *, kind):
+                results.append(f"on-{kind} callback")
 
-        def failure_callback(context):
-            custom_callback(context, kind="failure")
-            assert isinstance(context["exception"], self._Failure)
+            def failure_callback(context):
+                custom_callback(context, kind="failure")
+                assert isinstance(context["exception"], self._Failure)
+
+            callbacks = {
+                "on_execute_callback": functools.partial(custom_callback, kind="execute"),
+                "on_skipped_callback": functools.partial(custom_callback, kind="skipped"),
+                "on_success_callback": functools.partial(custom_callback, kind="success"),
+                "on_failure_callback": failure_callback,
+                "on_retry_callback": functools.partial(custom_callback, kind="retry"),
+            }
+            config = {}
+
+        callback_results = results
 
         class CustomOperator(BaseOperator):
-            results = collected_results
+            results = callback_results
             execute = execute_impl
 
-        task = CustomOperator(
-            task_id="task",
-            on_execute_callback=functools.partial(custom_callback, kind="execute"),
-            on_skipped_callback=functools.partial(custom_callback, kind="skipped"),
-            on_success_callback=functools.partial(custom_callback, kind="success"),
-            on_failure_callback=failure_callback,
-            on_retry_callback=functools.partial(custom_callback, kind="retry"),
-        )
+        task = CustomOperator(task_id="task", **callbacks)
         runtime_ti = create_runtime_ti(dag_id="dag", task=task, should_retry=should_retry)
         log = mock.MagicMock()
         context = runtime_ti.get_template_context()
-        state, _, error = run(runtime_ti, context, log)
-        finalize(runtime_ti, state, context, log, error)
+
+        with conf_vars(config):
+            state, _, error = run(runtime_ti, context, log)
+            finalize(runtime_ti, state, context, log, error)
 
         assert state == expected_state
-        assert collected_results == expected_results
+        assert results == expected_results
 
     @pytest.mark.parametrize(
         ("base_url", "expected_url"),
@@ -5040,32 +5120,47 @@ class TestTaskRunnerCallsCallbacks:
             log_url = runtime_ti.log_url
             assert log_url == expected_url
 
-    def test_task_runner_on_failure_callback_context(self, create_runtime_ti):
-        """Test that on_failure_callback context has end_date and duration."""
+    @pytest.mark.parametrize("use_executor_callback", [False, True], ids=["dag-processor", "executor"])
+    def test_task_runner_on_failure_callback_context(self, create_runtime_ti, use_executor_callback):
+        """Failure callbacks receive an end date and duration when run directly or by an executor."""
+        callback_data = {}
 
         def failure_callback(context):
             ti = context["task_instance"]
-            assert isinstance(ti.end_date, datetime)
-            duration = (ti.end_date - ti.start_date).total_seconds()
-            assert duration is not None
-            assert duration >= 0
+            callback_data["end_date"] = ti.end_date
+            callback_data["duration"] = (ti.end_date - ti.start_date).total_seconds() if ti.end_date else None
+
+        if use_executor_callback:
+            _reset_module_callback_context_tests()
+            callback = _failure_module_callback_context_test
+            callback_data = _module_failure_data
+            config = {("dag_processor", "run_callbacks"): "False"}
+        else:
+            callback = failure_callback
+            config = {}
 
         class FailingOperator(BaseOperator):
             def execute(self, context):
                 raise AirflowException("Failing task")
 
-        task = FailingOperator(task_id="failing_task", on_failure_callback=failure_callback)
+        task = FailingOperator(task_id="failing_task", on_failure_callback=callback)
         runtime_ti = create_runtime_ti(dag_id="dag", task=task)
         log = mock.MagicMock()
         context = runtime_ti.get_template_context()
-        state, _, error = run(runtime_ti, context, log)
-        finalize(runtime_ti, state, context, log, error)
+
+        with conf_vars(config):
+            state, _, error = run(runtime_ti, context, log)
+            finalize(runtime_ti, state, context, log, error)
 
         assert state == TaskInstanceState.FAILED
+        assert isinstance(callback_data["end_date"], datetime)
+        assert callback_data["duration"] is not None
+        assert callback_data["duration"] >= 0
 
-    def test_task_runner_on_success_callback_context(self, create_runtime_ti):
-        """Test that on_success_callback context has end_date and duration."""
-        callback_data = {}  # Store callback data for inspection
+    @pytest.mark.parametrize("use_executor_callback", [False, True], ids=["dag-processor", "executor"])
+    def test_task_runner_on_success_callback_context(self, create_runtime_ti, use_executor_callback):
+        """Success callbacks receive an end date and duration when run directly or by an executor."""
+        callback_data = {}
 
         def success_callback(context):
             ti = context["task_instance"]
@@ -5073,21 +5168,29 @@ class TestTaskRunnerCallsCallbacks:
             callback_data["duration"] = (ti.end_date - ti.start_date).total_seconds() if ti.end_date else None
             callback_data["start_date"] = ti.start_date
 
+        if use_executor_callback:
+            _reset_module_callback_context_tests()
+            callback = _success_module_callback_context_test
+            callback_data = _module_success_data
+            config = {("dag_processor", "run_callbacks"): "False"}
+        else:
+            callback = success_callback
+            config = {}
+
         class SuccessOperator(BaseOperator):
             def execute(self, context):
                 return "success"
 
-        task = SuccessOperator(task_id="success_task", on_success_callback=success_callback)
+        task = SuccessOperator(task_id="success_task", on_success_callback=callback)
         runtime_ti = create_runtime_ti(dag_id="dag", task=task)
         log = mock.MagicMock()
         context = runtime_ti.get_template_context()
 
-        state, _, error = run(runtime_ti, context, log)
-        finalize(runtime_ti, state, context, log, error)
+        with conf_vars(config):
+            state, _, error = run(runtime_ti, context, log)
+            finalize(runtime_ti, state, context, log, error)
 
         assert state == TaskInstanceState.SUCCESS
-
-        # Verify callback was called and data was captured
         assert "end_date" in callback_data, "Success callback should have been called"
         assert isinstance(callback_data["end_date"], datetime), (
             f"end_date should be datetime, got {type(callback_data['end_date'])}"

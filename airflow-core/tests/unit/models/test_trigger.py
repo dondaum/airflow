@@ -33,7 +33,7 @@ from airflow.jobs.job import Job
 from airflow.jobs.triggerer_job_runner import TriggererJobRunner
 from airflow.models import TaskInstance, Trigger
 from airflow.models.asset import AssetEvent, AssetModel, AssetWatcherModel
-from airflow.models.callback import Callback, TriggererCallback
+from airflow.models.callback import Callback, TriggererCallback, ExecutorCallback
 from airflow.models.taskinstancehistory import TaskInstanceHistory
 from airflow.models.trigger import handle_event_submit
 from airflow.models.xcom import XComModel
@@ -66,6 +66,17 @@ def session():
     """Fixture that provides a SQLAlchemy session"""
     with create_session() as session:
         yield session
+
+
+def mock_success_callback(context):
+    pass
+
+def mock_retry_callback(context):
+    pass
+
+def mock_failed_callback(context):
+    pass
+
 
 
 @pytest.fixture(autouse=True)
@@ -433,6 +444,29 @@ def test_submit_event_task_end_callback_includes_version_data(mock_send, session
     assert request.bundle_version == "some_hash"
     assert request.version_data == version_data
 
+@conf_vars({("dag_processor", "run_callbacks"): "False"})
+@patch("airflow.models.trigger.persist_executor_callbacks")
+def test_submit_event_task_end_callback_submits_executor_callbacks(mock_persist_executor_callbacks, session, create_task_instance):
+    """A finished deferred task's callback submits executor callbacks."""
+
+    trigger = Trigger(classpath="does.not.matter", kwargs={})
+    session.add(trigger)
+    task =  EmptyOperator(task_id="t1", on_success_callback=mock_success_callback)
+    task_instance = create_task_instance(
+        task=task, session=session, logical_date=timezone.utcnow(), state=State.DEFERRED
+    )
+    task_instance.trigger_id = trigger.id
+    session.commit()
+
+    Trigger.submit_event(trigger.id, TaskSuccessEvent(), session=session)
+    session.flush()
+
+    mock_persist_executor_callbacks.assert_called_once()
+    callbacks = mock_persist_executor_callbacks.call_args.kwargs['callbacks']
+    assert isinstance(callbacks[0], ExecutorCallback)
+    assert callbacks[0].data['kwargs']['context'] is not None
+    assert callbacks[0].data['kwargs']['context'].dag_run.logical_date == task_instance.dag_run.logical_date
+    assert callbacks[0].data['kwargs']['context'].max_tries == task_instance.max_tries
 
 @pytest.mark.parametrize(
     ("retries", "expected_state", "expected_callback_type", "expect_history_row"),
@@ -480,6 +514,80 @@ def test_submit_event_task_end_failed_respects_retries(
     mock_send.assert_called_once()
     request = mock_send.call_args.kwargs["callback"]
     assert request.task_callback_type == expected_callback_type
+
+    assert ti.next_method is None
+    assert ti.next_kwargs is None
+    assert ti.end_date is not None
+
+    tih = session.scalars(
+        select(TaskInstanceHistory).where(
+            TaskInstanceHistory.dag_id == ti.dag_id,
+            TaskInstanceHistory.task_id == ti.task_id,
+            TaskInstanceHistory.run_id == ti.run_id,
+        )
+    ).all()
+    if expect_history_row:
+        assert len(tih) == 1
+        assert ti.id != old_ti_id
+        assert tih[0].task_instance_id == old_ti_id
+    else:
+        assert tih == []
+        assert ti.id == old_ti_id
+
+
+@pytest.mark.parametrize(
+    ("retries", "expected_state", "callback_kind", "expected_callback_type", "expect_history_row"),
+    [
+        (1, TaskInstanceState.UP_FOR_RETRY, "retry", "mock_retry_callback", True),
+        (0, TaskInstanceState.FAILED, "failed", "mock_failed_callback", False),
+    ],
+)
+@conf_vars({("dag_processor", "run_callbacks"): "False"})
+@patch("airflow.models.trigger.persist_executor_callbacks")
+def test_submit_event_task_end_failed_respects_retries_with_executor_callback(
+    mock_persist_executor_callbacks,
+    session,
+    create_task_instance,
+    retries,
+    expected_state,
+    callback_kind,
+    expected_callback_type,
+    expect_history_row,
+):
+    """A trigger-emitted TaskFailedEvent should respect retry-eligibility: a deferred task with
+    retries remaining goes UP_FOR_RETRY (on_retry_callback), not straight to FAILED.
+
+    On the retry path, the finished try must also be archived to task_instance_history so
+    prior-try log lookups keep working after the trigger ends the deferred try.
+    """
+    trigger = Trigger(classpath="does.not.matter", kwargs={})
+    session.add(trigger)
+
+    if callback_kind == "retry":
+        task = EmptyOperator(task_id="t1", on_retry_callback=mock_retry_callback, retries=retries)
+    else:
+        task = EmptyOperator(task_id="t1", on_failure_callback=mock_failed_callback, retries=retries)
+    task_instance = create_task_instance(
+        task=task,
+        session=session,
+        logical_date=timezone.utcnow(),
+        state=State.DEFERRED,
+    )
+    task_instance.trigger_id = trigger.id
+    task_instance.try_number = 1
+    old_ti_id = task_instance.id
+    session.commit()
+
+    Trigger.submit_event(trigger.id, TaskFailedEvent(), session=session)
+    session.flush()
+
+    ti = session.scalar(select(TaskInstance))
+    assert ti.state == expected_state
+
+    mock_persist_executor_callbacks.assert_called_once()
+    callbacks = mock_persist_executor_callbacks.call_args.kwargs['callbacks']
+    assert isinstance(callbacks[0], ExecutorCallback)
+    assert callbacks[0].data['path'].split('.')[-1] == expected_callback_type
 
     assert ti.next_method is None
     assert ti.next_kwargs is None

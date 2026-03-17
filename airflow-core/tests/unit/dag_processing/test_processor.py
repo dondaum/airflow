@@ -1843,7 +1843,7 @@ class TestExecuteEmailCallbacks:
         mock_send_email.assert_called_once()
         call_args = mock_send_email.call_args[0]
 
-        assert call_args[0] == task
+        assert call_args[0] == task.email
         assert call_args[1].task_id == runtime_ti.task_id
         assert call_args[1].dag_id == runtime_ti.dag_id
         assert call_args[2] is not None  # context
@@ -1913,7 +1913,7 @@ class TestExecuteEmailCallbacks:
         mock_send_email.assert_called_once()
         call_args = mock_send_email.call_args[0]
 
-        assert call_args[0] == task
+        assert call_args[0] == task.email
         assert call_args[1].task_id == runtime_ti.task_id
         assert call_args[1].dag_id == runtime_ti.dag_id
         assert call_args[2] is not None  # context

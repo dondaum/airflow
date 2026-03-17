@@ -34,6 +34,7 @@ from airflow.sdk.definitions._internal.mixins import DependencyMixin
 from airflow.sdk.definitions._internal.node import DAGNode
 from airflow.sdk.definitions._internal.setup_teardown import SetupTeardownContext
 from airflow.sdk.definitions._internal.templater import Templater
+from airflow.sdk.definitions.callback import Callback
 from airflow.sdk.definitions.context import Context
 
 if TYPE_CHECKING:
@@ -46,7 +47,10 @@ if TYPE_CHECKING:
     from airflow.sdk.definitions.taskgroup import MappedTaskGroup
 
 TaskStateChangeCallback = Callable[[Context], None]
-TaskStateChangeCallbackAttrType: TypeAlias = TaskStateChangeCallback | list[TaskStateChangeCallback] | None
+TaskStateChangeCallbackAny: TypeAlias = TaskStateChangeCallback | Callback
+TaskStateChangeCallbackAttrType: TypeAlias = (
+    TaskStateChangeCallbackAny | Collection[TaskStateChangeCallbackAny] | None
+)
 
 DEFAULT_OWNER: str = conf.get_mandatory_value("operators", "default_owner")
 DEFAULT_POOL_SLOTS: int = 1

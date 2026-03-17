@@ -30,7 +30,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Sequence
 from urllib.parse import quote
 
 import attrs
@@ -69,6 +69,7 @@ from airflow.sdk.definitions.asset import (
     AssetUniqueKey,
     AssetUriRef,
 )
+from airflow.sdk.definitions.callback import SyncCallback
 from airflow.sdk.definitions.mappedoperator import MappedOperator
 from airflow.sdk.definitions.param import process_params
 from airflow.sdk.exceptions import (
@@ -2067,16 +2068,29 @@ def _run_task_state_change_callbacks(
     context: Context,
     log: Logger,
 ) -> None:
+    from importlib import import_module
+
     callback: Callable[[Context], None]
     for i, callback in enumerate(getattr(task, kind)):
         try:
-            create_executable_runner(callback, context_get_outlet_events(context), logger=log).run(context)
+            if isinstance(callback, SyncCallback):
+                module_path, function_name = callback.path.rsplit(".", 1)
+                module = import_module(module_path)
+                callback_callable = getattr(module, function_name)
+                create_executable_runner(
+                    callback_callable, context_get_outlet_events(context), logger=log
+                ).run(context)
+            # TODO: Think about AsyncCallbacks here.
+            else:
+                create_executable_runner(callback, context_get_outlet_events(context), logger=log).run(
+                    context
+                )
         except Exception:
             log.exception("Failed to run task callback", kind=kind, index=i, callback=callback)
 
 
 def _send_error_email_notification(
-    task: BaseOperator | MappedOperator,
+    email: str | Sequence[str] | None,
     ti: RuntimeTaskInstance,
     context: Context,
     error: BaseException | str | None,
@@ -2094,7 +2108,7 @@ def _send_error_email_notification(
     (``_execute_email_callbacks``) funnel through this function, so the resolved backend is used
     consistently regardless of how the task failed.
     """
-    if not task.email:
+    if not email:
         return
 
     email_backend = conf.get("email", "email_backend", fallback=_DEFAULT_EMAIL_BACKEND)
@@ -2152,7 +2166,7 @@ def _send_error_email_notification(
         "max_tries": ti.max_tries,
     }
     email_context = {**context, **additional_context}
-    to_emails = task.email
+    to_emails = email
     if not to_emails:
         return
 
