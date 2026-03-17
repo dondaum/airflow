@@ -80,6 +80,26 @@ def _format_kwargs_for_display(kwargs: dict | None) -> Any:
     return format_encoded_value_for_display(kwargs) if kwargs else ""
 
 
+#TODO: Find a better place for this function
+def persist_executor_callbacks(callbacks: list[Callback], session: Session) -> None:
+    """Store execturo callbacks and set their state to PENDING."""
+    for callback in callbacks:
+        if isinstance(callback, ExecutorCallback):
+            callback.state = CallbackState.PENDING
+            session.add(callback)
+        else:
+            raise ValueError(f"Unsupported callback type: {type(callback)}")
+
+
+#TODO: Is this needed ?
+class CallbackSource(str, Enum):
+    """Where/why this callback was triggered."""
+
+    DEADLINE = "deadline"
+    DAG = "dag"
+    TASK = "task"
+
+
 class CallbackType(str, Enum):
     """
     Types of Callbacks.

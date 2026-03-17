@@ -63,7 +63,11 @@ from airflow.serialization.helpers import (
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
-
+    from airflow.models.callback import (
+        CallbackDefinitionProtocol,
+        ImportPathCallbackDefProtocol,
+        ImportPathExecutorCallbackDefProtocol,
+    )
     from airflow.models.deadline_alert import DeadlineAlert as DeadlineAlertModel
     from airflow.partition_mappers.base import PartitionMapper
     from airflow.partition_mappers.wait_policy import WaitPolicy
@@ -438,6 +442,23 @@ def resolve_deadline_alert_interval(
     if isinstance(alert.interval, SerializedVariableInterval):
         return alert.interval.resolve(session=session)
     return alert.interval
+
+
+def decode_callback(encoded_data: dict) -> CallbackDefinitionProtocol:
+    """
+    Decode a previously serialized callback.
+
+    :meta private:
+    """
+    from airflow.sdk.serde import deserialize
+
+    data = encoded_data.get(Encoding.VAR, encoded_data)
+    ser_callback = deserialize(data["callback"])
+    if TYPE_CHECKING:
+        assert isinstance(
+            ser_callback, (ImportPathCallbackDefProtocol, ImportPathExecutorCallbackDefProtocol)
+        )
+    return ser_callback
 
 
 def decode_timetable(var: dict[str, Any]) -> CoreTimetable:
