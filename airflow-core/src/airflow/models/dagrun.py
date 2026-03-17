@@ -24,6 +24,7 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import datetime
+from importlib import import_module
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast, overload
 from uuid import UUID
 
@@ -87,6 +88,7 @@ from airflow.listeners.listener import get_listener_manager
 from airflow.models import Deadline, Log
 from airflow.models.backfill import Backfill
 from airflow.models.base import Base, StringID
+from airflow.models.callback import Callback, ImportPathExecutorCallbackDefProtocol
 from airflow.models.deadline_alert import DeadlineAlert as DeadlineAlertModel
 from airflow.models.taskinstance import TaskInstance as TI, _add_and_prime_mapped_ti, clear_task_instances
 from airflow.models.taskinstancehistory import TaskInstanceHistory as TIH
@@ -123,7 +125,8 @@ if TYPE_CHECKING:
     from airflow.api_fastapi.execution_api.datamodels.taskinstance import DagRun as DRDataModel
     from airflow.models.dag_version import DagVersion
     from airflow.models.taskinstancekey import TaskInstanceKey
-    from airflow.sdk import DAG as SDKDAG
+    from airflow.sdk import DAG as SDKDAG, Context
+    from airflow.sdk.definitions.callback import Callback as SDKCallback
     from airflow.serialization.definitions.dag import SerializedDAG
     from airflow.serialization.definitions.mappedoperator import Operator
     from airflow.timetables.base import Timetable
@@ -1251,7 +1254,7 @@ class DagRun(Base, LoggingMixin):
     @provide_session
     def update_state(
         self, *, session: Session = NEW_SESSION, execute_callbacks: bool = True
-    ) -> tuple[list[TI], DagCallbackRequest | None]:
+    ) -> tuple[list[TI], DagCallbackRequest | list[Callback] | None]:
         """
         Determine the overall state of the DagRun based on the state of its TaskInstances.
 
@@ -1262,7 +1265,7 @@ class DagRun(Base, LoggingMixin):
             needs to be executed
         """
         # Callback to execute in case of Task Failures
-        callback: DagCallbackRequest | None = None
+        callback: DagCallbackRequest | list[Callback] | None = None
 
         class _UnfinishedStates(NamedTuple):
             tis: Sequence[TI]
@@ -1518,7 +1521,7 @@ class DagRun(Base, LoggingMixin):
         relevant_ti: TI | None = None,
         reason: str = "success",
         execute: bool = False,
-    ) -> DagCallbackRequest | None:
+    ) -> DagCallbackRequest | list[Callback] | None:
         """Create a callback request for the DAG, or execute the callbacks directly if instructed, and return None."""
         # Historical task instances created before the dag_version table existed (migration
         # 0047_3_0_0_add_dag_versioning) have dag_version_id=None. The TaskInstance datamodel used to
@@ -1532,33 +1535,94 @@ class DagRun(Base, LoggingMixin):
                 relevant_ti,
             )
             relevant_ti = None
-        if not execute:
-            from airflow.models.dag_version import _resolve_version_data
 
-            # Only carry version_data for pinned runs so the callback initializes the bundle
-            # against the same version the run used.
-            version_data = _resolve_version_data(self.created_dag_version, self.bundle_version)
-            return DagCallbackRequest(
-                filepath=self.dag_model.relative_fileloc,
-                dag_id=self.dag_id,
-                run_id=self.run_id,
-                bundle_name=self.dag_model.bundle_name,
-                bundle_version=self.bundle_version,
-                version_data=version_data,
-                context_from_server=DagRunContext(
-                    dag_run=self,
-                    last_ti=relevant_ti,
-                ),
-                is_failure_callback=(not success),
-                msg=reason,
+        if execute:
+            self.execute_dag_callbacks(
+                dag=cast("SDKDAG", dag),
+                success=success,
+                relevant_ti=relevant_ti,
+                reason=reason,
             )
-        self.execute_dag_callbacks(
-            dag=cast("SDKDAG", dag),
+            return None
+
+        if not airflow_conf.getboolean("dag_processor", "run_callbacks"):
+            # Dag Callback runs either on a worker or triggerer
+            return self._create_serialized_callbacks(
+                dag=dag,
+                success=success,
+                relevant_ti=relevant_ti,
+                reason=reason,
+            )
+        # Dag Callback runs on the Dag processor
+        return self._create_dag_callback_request(
             success=success,
             relevant_ti=relevant_ti,
             reason=reason,
         )
-        return None
+
+    def _create_serialized_callbacks(
+        self,
+        dag: SerializedDAG,
+        success: bool,
+        relevant_ti: TI | None,
+        reason: str,
+    ) -> list[Callback] | None:
+        """Create serialized callbacks for success or failure when running on worker/triggerer."""
+        callbacks = dag.on_success_callback if success else dag.on_failure_callback
+
+        if not callbacks:
+            return None
+
+        context = DagRunContext(
+            dag_run=self,
+            last_ti=relevant_ti,
+            is_failure_callback=(not success),
+            msg=reason,
+        )
+
+        all_callbacks: list[Callback] = []
+        for callback in callbacks:
+            make_callback = Callback.create_from_sdk_def(
+                callback_def=callback,
+                dag_id=self.dag_id,
+                dag_run_id=self.id,
+            )
+            make_callback.data["kwargs"] = {"context": context}
+            all_callbacks.append(make_callback)
+
+        return all_callbacks
+
+    def _create_dag_callback_request(
+        self,
+        success: bool,
+        relevant_ti: TI | None,
+        reason: str,
+    ) -> DagCallbackRequest:
+        """
+        Create a DAG callback request when running on dag processor.
+
+        Returns:
+            DagCallbackRequest object
+        """
+        from airflow.models.dag_version import _resolve_version_data
+
+        # Only carry version_data for pinned runs so the callback initializes the bundle
+        # against the same version the run used.
+        version_data = _resolve_version_data(self.created_dag_version, self.bundle_version)
+        return DagCallbackRequest(
+            filepath=self.dag_model.relative_fileloc,
+            dag_id=self.dag_id,
+            run_id=self.run_id,
+            bundle_name=self.dag_model.bundle_name,
+            bundle_version=self.bundle_version,
+            version_data=version_data,
+            context_from_server=DagRunContext(
+                dag_run=self,
+                last_ti=relevant_ti,
+            ),
+            is_failure_callback=(not success),
+            msg=reason,
+        )
 
     def execute_dag_callbacks(
         self, dag: SDKDAG, success: bool = True, relevant_ti: TI | None = None, reason: str = "success"
@@ -1597,19 +1661,37 @@ class DagRun(Base, LoggingMixin):
         context["reason"] = reason
 
         callbacks = dag.on_success_callback if success else dag.on_failure_callback
+
         if not callbacks:
             self.log.warning("Callback requested, but dag didn't have any for DAG: %s.", dag.dag_id)
             return
-        callbacks = callbacks if isinstance(callbacks, list) else [callbacks]
 
-        for callback in callbacks:
+        callback_list: list[Callable[[Context], None] | SDKCallback] = []
+
+        if isinstance(callbacks, list):
+            callback_list.extend(callbacks)
+        else:
+            callback_list.append(callbacks)
+
+        for callback in callback_list:
             self.log.info(
                 "Executing on_%s dag callback: %s",
                 "success" if success else "failure",
                 callback.__name__ if hasattr(callback, "__name__") else repr(callback),
             )
             try:
-                callback(context)
+                if isinstance(callback, ImportPathExecutorCallbackDefProtocol):
+                    module_path, function_name = callback.path.rsplit(".", 1)
+                    module = import_module(module_path)
+                    callback_callable = getattr(module, function_name)
+                    # TODO: Do we need to pass any kwargs ?
+                    # TODO: This will fail if callback is defined in the same Dag module as
+                    #       Dag Parsing changes the module name to unusual_prefix_*
+                    callback_callable(context)
+                elif callable(callback):
+                    callback(context)
+                else:
+                    raise ValueError(f"Unsupported callback type: {type(callback)} for DAG: {dag.dag_id}")
             except Exception:
                 self.log.exception("Callback failed for %s", dag.dag_id)
                 stats.incr(

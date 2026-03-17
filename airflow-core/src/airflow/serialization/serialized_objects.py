@@ -44,6 +44,7 @@ from pendulum.tz.timezone import FixedTimezone, Timezone
 from airflow._shared.module_loading import qualname
 from airflow._shared.timezones.timezone import from_timestamp, parse_timezone, utcnow
 from airflow.callbacks.callback_requests import DagCallbackRequest, TaskCallbackRequest
+from airflow.configuration import conf
 from airflow.exceptions import AirflowException, DeserializationError, SerializationError
 from airflow.models.connection import Connection
 from airflow.models.expandinput import SchedulerMappedArgument, create_expand_input
@@ -57,6 +58,7 @@ from airflow.sdk.definitions.asset import (
     AssetUniqueKey,
     BaseAsset,
 )
+from airflow.sdk.definitions.callback import Callback
 from airflow.sdk.definitions.deadline import DeadlineAlert
 from airflow.sdk.definitions.mappedoperator import MappedOperator
 from airflow.sdk.definitions.operator_resources import Resources
@@ -67,6 +69,7 @@ from airflow.sdk.execution_time.context import OutletEventAccessor, OutletEventA
 from airflow.serialization.dag_dependency import DagDependency
 from airflow.serialization.decoders import (
     decode_asset_like,
+    decode_callback,
     decode_deadline_alert,
     decode_relativedelta,
     decode_timetable,
@@ -88,6 +91,7 @@ from airflow.serialization.definitions.xcom_arg import SchedulerXComArg, deseria
 from airflow.serialization.encoders import (
     coerce_to_core_timetable,
     encode_asset_like,
+    encode_callback,
     encode_deadline_alert,
     encode_expand_input,
     encode_relativedelta,
@@ -115,6 +119,7 @@ if TYPE_CHECKING:
     from kubernetes.client import models as k8s  # noqa: TC004
     from kubernetes.client.api_client import ApiClient  # noqa: TC004
 
+    from airflow.models.callback import CallbackDefinitionProtocol
     from airflow.models.expandinput import SchedulerExpandInput
     from airflow.sdk import BaseOperatorLink
     from airflow.sdk.definitions._internal.node import DAGNode as SDKDAGNode
@@ -136,6 +141,8 @@ _HAS_CALLBACK_FIELDS = frozenset(f"has_on_{x}_callback" for x in _CALLBACK_TYPES
 # parse). Only a boolean ``has_<field>`` flag is stored; the live object is recovered by
 # re-parsing the DAG source on the worker. Applies both to a mapped operator's
 # ``partial_kwargs`` and to a DAG's ``default_args``.
+# Only true for non executor callbacks. For executor callbacks, the callback is serialized as
+# a SyncCallback object and stored in the serialized DAG.
 _HAS_FLAG_FIELDS = _OPERATOR_CALLBACK_FIELDS | frozenset({"retry_policy"})
 
 
@@ -451,6 +458,7 @@ class BaseSerialization:
         """Serialize an object to JSON."""
         serialized_object: dict[str, Any] = {}
         keys_to_serialize = object_to_serialize.get_serialized_fields()
+        # raise ValueError(f"keys_to_serialize: {keys_to_serialize}, decorated_fields: {decorated_fields}")
         for key in keys_to_serialize:
             # None is ignored in serialized form and is added back in deserialization.
             value = getattr(object_to_serialize, key, None)
@@ -544,6 +552,8 @@ class BaseSerialization:
             return cls._encode(DagSerialization.serialize_dag(var), type_=DAT.DAG)
         elif isinstance(var, (DeadlineAlert, SerializedDeadlineAlert)):
             return cls._encode(encode_deadline_alert(var), type_=DAT.DEADLINE_ALERT)
+        elif isinstance(var, Callback):
+            return cls._encode(encode_callback(var), type_=DAT.DAG_CALLBACK)
         elif isinstance(var, Resources):
             return var.to_dict()
         elif isinstance(var, MappedOperator):
@@ -723,6 +733,8 @@ class BaseSerialization:
             return NOTSET
         elif type_ == DAT.DEADLINE_ALERT:
             return decode_deadline_alert(var)
+        elif type_ == DAT.DAG_CALLBACK:
+            return decode_callback(var)
         else:
             raise TypeError(f"Invalid type {type_!s} in deserialization.")
 
@@ -1012,6 +1024,11 @@ class OperatorSerialization(DAGNode, BaseSerialization):
                     # Store only a has_<field> flag, never the object (see _HAS_FLAG_FIELDS).
                     if bool(v):
                         serialized_op["partial_kwargs"][f"has_{k}"] = True
+                        # For executor callbacks also store the callback definitions
+                        if not conf.getboolean("dag_processor", "run_callbacks"):
+                            serialized_op["partial_kwargs"][k] = [
+                                encode_callback(cb) for cb in v if isinstance(cb, Callback)
+                            ]
                     continue
                 serialized_op["partial_kwargs"].update({k: cls.serialize(v)})
 
@@ -1127,6 +1144,7 @@ class OperatorSerialization(DAGNode, BaseSerialization):
 
         # Preprocess and upgrade all field names for backward compatibility and consistency
         encoded_op = cls._preprocess_encoded_operator(encoded_op)
+
         # Extra Operator Links defined in Plugins
         op_extra_links_from_plugin = {}
 
@@ -1209,6 +1227,8 @@ class OperatorSerialization(DAGNode, BaseSerialization):
                     v = 2.0 if v else 0
                 else:
                     v = float(v)
+            elif k in _OPERATOR_CALLBACK_FIELDS and not conf.getboolean("dag_processor", "run_callbacks"):
+                v = [decode_callback(scb) for scb in v]
             else:
                 # Apply centralized deserialization for all other fields
                 v = cls._deserialize_field_value(k, v)
@@ -1387,7 +1407,10 @@ class OperatorSerialization(DAGNode, BaseSerialization):
             new_key = f"has_{old_key}"
             if old_key in preprocessed:
                 preprocessed[new_key] = bool(preprocessed[old_key])
-                del preprocessed[old_key]
+                # Don't remove the callback fields whenever we run executor callbacks,
+                # as we need to preserve the actual callback definitions for execution.
+                if conf.getboolean("dag_processor", "run_callbacks"):
+                    del preprocessed[old_key]
 
         # Handle other field renames and upgrades from old format/name
         field_renames = {
@@ -1630,6 +1653,10 @@ class OperatorSerialization(DAGNode, BaseSerialization):
             return set(value) if value is not None else set()
         elif field_name in _HAS_CALLBACK_FIELDS:
             return bool(value)
+        elif field_name in _OPERATOR_CALLBACK_FIELDS and not conf.getboolean(
+            "dag_processor", "run_callbacks"
+        ):
+            return [decode_callback(scb) for scb in value]
         elif field_name in {"retry_delay", "execution_timeout", "max_retry_delay"}:
             # Reuse existing timedelta deserialization logic
             if value is not None:
@@ -1778,22 +1805,46 @@ class DagSerialization(BaseSerialization):
             # has_on_*_callback are only stored if the value is True, as the default is False
             if dag.has_on_success_callback:
                 serialized_dag["has_on_success_callback"] = True
+                # Some callbacks run on the Worker or Triggerer. We need to store the callback reference for later.
+                if not conf.getboolean("dag_processor", "run_callbacks"):
+                    callback_list = (
+                        dag.on_success_callback
+                        if isinstance(dag.on_success_callback, list)
+                        else [dag.on_success_callback]
+                    )
+                    serialized_dag["on_success_callback"] = [
+                        encode_callback(cb) for cb in callback_list if isinstance(cb, Callback)
+                    ]
+
             if dag.has_on_failure_callback:
                 serialized_dag["has_on_failure_callback"] = True
+                if not conf.getboolean("dag_processor", "run_callbacks"):
+                    callback_list = (
+                        dag.on_failure_callback
+                        if isinstance(dag.on_failure_callback, list)
+                        else [dag.on_failure_callback]
+                    )
+                    serialized_dag["on_failure_callback"] = [
+                        encode_callback(cb) for cb in callback_list if isinstance(cb, Callback)
+                    ]
 
             # TODO: Move this logic to a better place -- ideally before serializing contents of default_args.
             #   There is some duplication with this and SerializedBaseOperator.partial_kwargs serialization.
             #   Ideally default_args goes through same logic as fields of SerializedBaseOperator.
-            if serialized_dag.get("default_args", {}):
-                default_args_dict = serialized_dag["default_args"][Encoding.VAR]
-                flags_to_remove = []
-                for k, v in list(default_args_dict.items()):
+            if default_args := serialized_dag.get("default_args", {}).get(Encoding.VAR):
+                dag_proc_run_callbacks = conf.getboolean("dag_processor", "run_callbacks")
+
+                for k, v in list(default_args.items()):
                     if k in _HAS_FLAG_FIELDS:
                         if bool(v):
-                            default_args_dict[f"has_{k}"] = True
-                        flags_to_remove.append(k)
-                for k in flags_to_remove:
-                    del default_args_dict[k]
+                            default_args[f"has_{k}"] = True
+                            if not dag_proc_run_callbacks:
+                                default_args[k] = [
+                                    encode_callback(cb) for cb in v if isinstance(cb, Callback)
+                                ]
+
+                        if dag_proc_run_callbacks:
+                            default_args.pop(k, None)
 
             return serialized_dag
         except SerializationError:
@@ -1902,10 +1953,24 @@ class DagSerialization(BaseSerialization):
                 tg.add(task)
 
         # Set has_on_*_callbacks to True if they exist in Serialized blob as False is the default
+        # if "has_on_success_callback" in encoded_dag:
         if "has_on_success_callback" in encoded_dag:
             dag.has_on_success_callback = True
+
+            if not conf.getboolean("dag_processor", "run_callbacks"):
+                ser_success_callbacks: list[CallbackDefinitionProtocol] = []
+                for scb in encoded_dag.get("on_success_callback", []):
+                    ser_success_callbacks.append(decode_callback(scb))
+                dag.on_success_callback = ser_success_callbacks
+
         if "has_on_failure_callback" in encoded_dag:
             dag.has_on_failure_callback = True
+
+            if not conf.getboolean("dag_processor", "run_callbacks"):
+                ser_failure_callbacks: list[CallbackDefinitionProtocol] = []
+                for fcb in encoded_dag.get("on_failure_callback", []):
+                    ser_failure_callbacks.append(decode_callback(fcb))
+                dag.on_failure_callback = ser_failure_callbacks
 
         dag.deadline = encoded_dag.get("deadline")
 
@@ -2262,6 +2327,8 @@ class LazyDeserializedDAG(pydantic.BaseModel):
         "dag_display_name",
         "has_on_success_callback",
         "has_on_failure_callback",
+        "on_success_callback",
+        "on_failure_callback",
         "tags",
         # Attr properties that are nullable, or have a default that loads from config
         "description",

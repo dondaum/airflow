@@ -1225,7 +1225,7 @@
       "type": "object"
     },
     "DagRunContext": {
-      "description": "Class to pass context info from the server to build a Execution context object.",
+      "description": "Class to pass context info from the server to build a Execution context object for a Callback.",
       "properties": {
         "dag_run": {
           "anyOf": [
@@ -1248,6 +1248,30 @@
             }
           ],
           "default": null
+        },
+        "is_failure_callback": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Is Failure Callback"
+        },
+        "msg": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Msg"
         }
       },
       "title": "DagRunContext",

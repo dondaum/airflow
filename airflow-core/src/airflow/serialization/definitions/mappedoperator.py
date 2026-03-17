@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     import pendulum
 
     from airflow.models import TaskInstance
+    from airflow.models.callback import CallbackDefinitionProtocol
     from airflow.models.expandinput import SchedulerExpandInput
     from airflow.sdk import Context
     from airflow.sdk.definitions._internal.node import DAGNode as TaskSDKDAGNode
@@ -268,6 +269,26 @@ class SerializedMappedOperator(DAGNode):
     @property
     def has_on_skipped_callback(self) -> bool:
         return self._get_partial_kwargs_or_operator_default("has_on_skipped_callback")
+
+    @property
+    def on_execute_callback(self) -> list[CallbackDefinitionProtocol] | None:
+        return self._get_partial_kwargs_or_operator_default("on_execute_callback")
+
+    @property
+    def on_failure_callback(self) -> list[CallbackDefinitionProtocol] | None:
+        return self._get_partial_kwargs_or_operator_default("on_failure_callback")
+
+    @property
+    def on_retry_callback(self) -> list[CallbackDefinitionProtocol] | None:
+        return self._get_partial_kwargs_or_operator_default("on_retry_callback")
+
+    @property
+    def on_success_callback(self) -> list[CallbackDefinitionProtocol] | None:
+        return self._get_partial_kwargs_or_operator_default("on_success_callback")
+
+    @property
+    def on_skipped_callback(self) -> list[CallbackDefinitionProtocol] | None:
+        return self._get_partial_kwargs_or_operator_default("on_skipped_callback")
 
     @property
     def has_retry_policy(self) -> bool:

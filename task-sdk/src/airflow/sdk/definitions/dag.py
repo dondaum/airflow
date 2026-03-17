@@ -46,6 +46,7 @@ from airflow.sdk.bases.timetable import BaseTimetable
 from airflow.sdk.definitions._internal.node import DAGNode, validate_key
 from airflow.sdk.definitions._internal.types import NOTSET, ArgNotSet, is_arg_set
 from airflow.sdk.definitions.asset import AssetAll, BaseAsset
+from airflow.sdk.definitions.callback import Callback, SyncCallback
 from airflow.sdk.definitions.context import Context
 from airflow.sdk.definitions.deadline import DeadlineAlert
 from airflow.sdk.definitions.param import DagParam, ParamsDict
@@ -232,6 +233,34 @@ def _convert_deadline(deadline: list[DeadlineAlert] | DeadlineAlert | None) -> l
     if isinstance(deadline, DeadlineAlert):
         return [deadline]
     return list(deadline)
+
+
+def _convert_callback(
+    callback: None | DagStateChangeCallback | list[DagStateChangeCallback] | Callback | list[Callback],
+) -> Callback | list[Callback] | None | DagStateChangeCallback | list[DagStateChangeCallback]:
+    """Convert on_success_callback and on_failure_callback parameter to a list of Callback objects."""
+    from airflow.sdk.configuration import conf
+
+    if callback is None:
+        return None
+    if conf.getboolean("dag_processor", "run_callbacks"):
+        return callback
+    all_callbacks: list[Callback] = []
+    if isinstance(callback, Callback):
+        all_callbacks.append(callback)
+    elif callable(callback):
+        # TODO: Think about AsyncCallbacks here too, but for now we can assume that if someone is passing a raw callable they want it to be a SyncCallback
+        all_callbacks.append(SyncCallback(callback_callable=callback, kwargs=None, executor=None))
+    elif isinstance(callback, list):
+        for cb in callback:
+            if isinstance(cb, Callback):
+                all_callbacks.append(cb)
+            elif callable(cb):
+                # TODO: Think about AsyncCallbacks here too, but for now we can assume that if someone is passing a raw callable they want it to be a SyncCallback
+                all_callbacks.append(SyncCallback(callback_callable=cb, kwargs=None, executor=None))
+            else:
+                raise ValueError(f"Invalid callback type: {type(cb)}")
+    return all_callbacks
 
 
 def _convert_doc_md(doc_md: str | None) -> str | None:
@@ -518,8 +547,18 @@ class DAG:
     catchup: bool = attrs.field(
         factory=_config_bool_factory("scheduler", "catchup_by_default"),
     )
-    on_success_callback: None | DagStateChangeCallback | list[DagStateChangeCallback] = None
-    on_failure_callback: None | DagStateChangeCallback | list[DagStateChangeCallback] = None
+    on_success_callback: (
+        None | DagStateChangeCallback | list[DagStateChangeCallback] | Callback | list[Callback]
+    ) = attrs.field(
+        default=None,
+        converter=_convert_callback,
+    )
+    on_failure_callback: (
+        None | DagStateChangeCallback | list[DagStateChangeCallback] | Callback | list[Callback]
+    ) = attrs.field(
+        default=None,
+        converter=_convert_callback,
+    )
     doc_md: str | None = attrs.field(default=None, converter=_convert_doc_md)
     params: ParamsDict = attrs.field(
         # mypy doesn't really like passing the Converter object
@@ -1363,8 +1402,8 @@ class DAG:
 
             # Scheduler DAG shouldn't have these attributes, but assigning them
             # here is an easy hack to get this test() thing working.
-            scheduler_dag.on_success_callback = self.on_success_callback  # type: ignore[attr-defined, union-attr]
-            scheduler_dag.on_failure_callback = self.on_failure_callback  # type: ignore[attr-defined, union-attr]
+            scheduler_dag.on_success_callback = self.on_success_callback  # type: ignore[attr-defined, union-attr, assignment]
+            scheduler_dag.on_failure_callback = self.on_failure_callback  # type: ignore[attr-defined, union-attr, assignment]
 
             dr: DagRun = get_or_create_dagrun(
                 dag=scheduler_dag,
@@ -1634,8 +1673,16 @@ if TYPE_CHECKING:
         max_consecutive_failed_dag_runs: int = ...,
         dagrun_timeout: timedelta | None = None,
         catchup: bool = ...,
-        on_success_callback: None | DagStateChangeCallback | list[DagStateChangeCallback] = None,
-        on_failure_callback: None | DagStateChangeCallback | list[DagStateChangeCallback] = None,
+        on_success_callback: None
+        | DagStateChangeCallback
+        | list[DagStateChangeCallback]
+        | Callback
+        | list[Callback] = None,
+        on_failure_callback: None
+        | DagStateChangeCallback
+        | list[DagStateChangeCallback]
+        | Callback
+        | list[Callback] = None,
         deadline: list[DeadlineAlert] | DeadlineAlert | None = None,
         doc_md: str | None = None,
         params: ParamsDict | dict[str, Any] | None = None,

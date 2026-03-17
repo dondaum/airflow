@@ -69,6 +69,7 @@ from airflow.sdk.definitions.asset import (
     AssetUniqueKey,
     AssetUriRef,
 )
+from airflow.sdk.definitions.callback import SyncCallback
 from airflow.sdk.definitions.mappedoperator import MappedOperator
 from airflow.sdk.definitions.param import process_params
 from airflow.sdk.exceptions import (
@@ -2067,10 +2068,23 @@ def _run_task_state_change_callbacks(
     context: Context,
     log: Logger,
 ) -> None:
+    from importlib import import_module
+
     callback: Callable[[Context], None]
     for i, callback in enumerate(getattr(task, kind)):
         try:
-            create_executable_runner(callback, context_get_outlet_events(context), logger=log).run(context)
+            if isinstance(callback, SyncCallback):
+                module_path, function_name = callback.path.rsplit(".", 1)
+                module = import_module(module_path)
+                callback_callable = getattr(module, function_name)
+                create_executable_runner(
+                    callback_callable, context_get_outlet_events(context), logger=log
+                ).run(context)
+            # TODO: Think about AsyncCallbacks here.
+            else:
+                create_executable_runner(callback, context_get_outlet_events(context), logger=log).run(
+                    context
+                )
         except Exception:
             log.exception("Failed to run task callback", kind=kind, index=i, callback=callback)
 

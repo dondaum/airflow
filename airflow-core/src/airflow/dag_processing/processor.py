@@ -39,6 +39,7 @@ from airflow.configuration import conf
 from airflow.dag_processing.bundles.base import BundleVersionLock
 from airflow.dag_processing.dagbag import BundleDagBag, DagBag
 from airflow.models.dag import DagModel
+from airflow.sdk.definitions.callback import Callback
 from airflow.sdk.exceptions import TaskNotFound
 from airflow.sdk.execution_time import supervisor
 from airflow.sdk.execution_time.comms import (
@@ -367,12 +368,21 @@ def _execute_dag_callbacks(dagbag: DagBag, request: DagCallbackRequest, log: Fil
     from airflow.sdk.api.datamodels._generated import TIRunContext
 
     dag, _ = _get_dag_with_task(dagbag, request.dag_id)
-    callbacks = dag.on_failure_callback if request.is_failure_callback else dag.on_success_callback
-    if not callbacks:
+    dag_callbacks = dag.on_failure_callback if request.is_failure_callback else dag.on_success_callback
+    if not dag_callbacks:
         log.warning("Callback requested, but dag didn't have any", dag_id=request.dag_id)
         return
 
-    callbacks = callbacks if isinstance(callbacks, list) else [callbacks]
+    callback_list = dag_callbacks if isinstance(dag_callbacks, list) else [dag_callbacks]
+    callbacks: list[Callable[[Context], None]] = []
+    # Then validate each item
+    for cb in callback_list:
+        if isinstance(cb, Callback):
+            raise TypeError("Callback objects not allowed, use plain callables")
+        if not callable(cb):
+            raise TypeError("All items must be callable")
+        callbacks.append(cb)
+
     ctx_from_server = request.context_from_server
 
     context: Context = {
@@ -446,11 +456,11 @@ def _execute_task_callbacks(dagbag: DagBag, request: TaskCallbackRequest, log: F
         assert task is not None
 
     if request.task_callback_type is TaskInstanceState.UP_FOR_RETRY:
-        callbacks = task.on_retry_callback
+        task_callbacks = task.on_retry_callback
     else:
-        callbacks = task.on_failure_callback
+        task_callbacks = task.on_failure_callback
 
-    if not callbacks:
+    if not task_callbacks:
         log.warning(
             "Callback requested but no callback found",
             dag_id=request.ti.dag_id,
@@ -460,7 +470,15 @@ def _execute_task_callbacks(dagbag: DagBag, request: TaskCallbackRequest, log: F
         )
         return
 
-    callbacks = callbacks if isinstance(callbacks, Sequence) else [callbacks]
+    callback_list = task_callbacks if isinstance(task_callbacks, Sequence) else [task_callbacks]
+    callbacks: list[Callable[[Context], None]] = []
+    # Then validate each item
+    for cb in callback_list:
+        if isinstance(cb, Callback):
+            raise TypeError("Callback objects not allowed, use plain callables")
+        if not callable(cb):
+            raise TypeError("All items must be callable")
+        callbacks.append(cb)
     ctx_from_server = request.context_from_server
 
     if ctx_from_server is not None:

@@ -100,10 +100,10 @@ def execute_callback(
 
     Example:
         # Function callback
-        execute_callback("my_module.alert_func", {"msg": "Alert!", "context": {...}}, log)
+        execute_callback("my_module.alert_func", {"msg": "Alert!", "context": {...}}, "path/to/dag", log)
 
         # Notifier callback
-        execute_callback("airflow.providers.slack...SlackWebhookNotifier", {"text": "Alert!"}, log)
+        execute_callback("airflow.providers.slack...SlackWebhookNotifier", {"text": "Alert!"}, "path/to/dag", "path/to/bundle", log)
 
     :param callback_path: Dot-separated import path to the callback function or class.
     :param callback_kwargs: Keyword arguments to pass to the callback.
@@ -138,12 +138,14 @@ def execute_callback(
             module = import_module(module_path)
         callback_callable = getattr(module, function_name)
 
-        log.debug("Executing callback", callback_path=callback_path, callback_kwargs=callback_kwargs)
+        log.info("Executing callback", callback_path=callback_path, callback_kwargs=callback_kwargs)
 
         kwargs_without_context = {k: v for k, v in callback_kwargs.items() if k != "context"}
+        log.info("Callback arguments without context", kwargs_without_context=kwargs_without_context)
 
         # Call the callable with all kwargs if it accepts context, otherwise strip context.
         if accepts_context(callback_callable):
+            log.info("Callback accepts context; passing full kwargs", callback_path=callback_path)
             result = callback_callable(**callback_kwargs)
         else:
             result = callback_callable(**kwargs_without_context)
@@ -154,6 +156,7 @@ def execute_callback(
         # Some callables (like BaseNotifier.__call__) only accept positional args,
         # so check the signature first rather than catching a broad TypeError.
         if callable(result):
+            log.info("Callback result is callable; invoking it", callback_path=callback_path)
             context = callback_kwargs.get("context", {})
             if accepts_keyword_args(result):
                 result = result(context=context) if accepts_context(result) else result()
@@ -230,12 +233,15 @@ class CallbackSubprocess(WatchedSubprocess):
                         version=bundle_info.version,
                         version_data=bundle_info.version_data,
                     )
+                    _log.info(bundle_info)
+                    _log.info(str(bundle.path))
                     bundle.initialize()
                     if (bundle_path := str(bundle.path)) not in sys.path:
                         sys.path.append(bundle_path)
-                        _log.debug(
+                        _log.info(
                             "Added bundle path to sys.path", bundle_name=bundle_info.name, path=bundle_path
                         )
+                    _log.info(sys.path)
                 except Exception:
                     _log.warning(
                         "Failed to initialize DAG bundle for callback",
