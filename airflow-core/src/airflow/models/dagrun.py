@@ -1118,6 +1118,9 @@ class DagRun(Base, LoggingMixin):
                     key=lambda ti: ti.end_date or timezone.make_aware(datetime.min),
                     default=None,
                 )
+                self.log.info("----------------------------")
+                self.log.info(dag.on_failure_callback)
+                self.log.info("----------------------------")
                 callback = self.produce_dag_callback(
                     dag=dag,
                     success=False,
@@ -1148,6 +1151,9 @@ class DagRun(Base, LoggingMixin):
                     key=lambda ti: ti.end_date or timezone.make_aware(datetime.min),
                     default=None,
                 )
+                self.log.info("----------------------------")
+                self.log.info(dag.on_success_callback)
+                self.log.info("----------------------------")
                 callback = self.produce_dag_callback(
                     dag=dag,
                     success=True,
@@ -1155,6 +1161,9 @@ class DagRun(Base, LoggingMixin):
                     reason="success",
                     execute=execute_callbacks,
                 )
+                self.log.info(callback.dag_id)
+                self.log.info(callback)
+                self.log.info("----------------------------")
 
             if dag.deadline:
                 # The dagrun has succeeded.  If there were any Deadlines for it which were not breached, they are no longer needed.

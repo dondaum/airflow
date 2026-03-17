@@ -34,6 +34,7 @@ from airflow._shared.timezones import timezone
 from airflow.models.base import Base
 from airflow.models.callback import (
     Callback,
+    CallbackSource,
     ExecutorCallback,
     TriggererCallback,
 )
@@ -132,7 +133,10 @@ class Deadline(Base):
         self.dagrun_id = dagrun_id
         self.missed = False
         self.callback = Callback.create_from_sdk_def(
-            callback_def=callback, prefix=CALLBACK_METRICS_PREFIX, dag_id=dag_id
+            callback_def=callback,
+            prefix=CALLBACK_METRICS_PREFIX,
+            dag_id=dag_id,
+            callback_source=CallbackSource.DEADLINE,
         )
         self.deadline_alert_id = deadline_alert_id
 
@@ -231,22 +235,24 @@ class Deadline(Base):
 
         if isinstance(self.callback, TriggererCallback):
             # Update the callback with context before queuing
-            if "kwargs" not in self.callback.data:
-                self.callback.data["kwargs"] = {}
-            self.callback.data["kwargs"] = (self.callback.data.get("kwargs") or {}) | {
-                "context": get_simple_context()
-            }
+            if "kwargs" not in self.callback.data["callback"]:
+                self.callback.data["callback"]["kwargs"] = {}
+            self.callback.data["callback"]["kwargs"] = (
+                self.callback.data["callback"].get("kwargs") or {}
+            ) | {"context": get_simple_context()}
+            self.callback.data["source"] = CallbackSource.DEADLINE
 
             self.callback.queue()
             session.add(self.callback)
             session.flush()
 
         elif isinstance(self.callback, ExecutorCallback):
-            if "kwargs" not in self.callback.data:
-                self.callback.data["kwargs"] = {}
-            self.callback.data["kwargs"] = (self.callback.data.get("kwargs") or {}) | {
-                "context": get_simple_context()
-            }
+            if "kwargs" not in self.callback.data["callback"]:
+                self.callback.data["callback"]["kwargs"] = {}
+            self.callback.data["callback"]["kwargs"] = (
+                self.callback.data["callback"].get("kwargs") or {}
+            ) | {"context": get_simple_context()}
+            self.callback.data["source"] = CallbackSource.DEADLINE
             self.callback.data["deadline_id"] = str(self.id)
             self.callback.data["dag_run_id"] = str(self.dagrun.id)
             self.callback.data["dag_id"] = self.dagrun.dag_id

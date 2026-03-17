@@ -83,6 +83,7 @@ if TYPE_CHECKING:
 
     from airflow.sdk.definitions._internal.expandinput import ExpandInput
     from airflow.sdk.definitions.asset import BaseAsset
+    from airflow.sdk.definitions.callback import Callback
     from airflow.sdk.definitions.deadline import DeadlineAlert
     from airflow.triggers.base import BaseEventTrigger
 
@@ -205,6 +206,19 @@ def encode_deadline_alert(d: DeadlineAlert | SerializedDeadlineAlert) -> dict[st
         "reference": encode_deadline_reference(d.reference),
         "interval": d.interval.total_seconds(),
         "callback": serialize(d.callback),
+    }
+
+
+def encode_callback(c: Callback) -> dict[str, Any]:
+    """
+    Encode a callback.
+
+    :meta private:
+    """
+    from airflow.sdk.serde import serialize
+
+    return {
+        "callback": serialize(c),
     }
 
 

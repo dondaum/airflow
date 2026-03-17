@@ -57,6 +57,7 @@ from airflow.sdk.definitions.asset import (
     AssetUniqueKey,
     BaseAsset,
 )
+from airflow.sdk.definitions.callback import Callback
 from airflow.sdk.definitions.deadline import DeadlineAlert
 from airflow.sdk.definitions.mappedoperator import MappedOperator
 from airflow.sdk.definitions.operator_resources import Resources
@@ -67,6 +68,7 @@ from airflow.sdk.execution_time.context import OutletEventAccessor, OutletEventA
 from airflow.serialization.dag_dependency import DagDependency
 from airflow.serialization.decoders import (
     decode_asset_like,
+    decode_callback,
     decode_deadline_alert,
     decode_relativedelta,
     decode_timetable,
@@ -88,6 +90,7 @@ from airflow.serialization.definitions.xcom_arg import SchedulerXComArg, deseria
 from airflow.serialization.encoders import (
     coerce_to_core_timetable,
     encode_asset_like,
+    encode_callback,
     encode_deadline_alert,
     encode_expand_input,
     encode_relativedelta,
@@ -513,6 +516,8 @@ class BaseSerialization:
             return cls._encode(DagSerialization.serialize_dag(var), type_=DAT.DAG)
         elif isinstance(var, (DeadlineAlert, SerializedDeadlineAlert)):
             return cls._encode(encode_deadline_alert(var), type_=DAT.DEADLINE_ALERT)
+        elif isinstance(var, Callback):
+            return cls._encode(encode_callback(var), type_=DAT.DAG_CALLBACK)
         elif isinstance(var, Resources):
             return var.to_dict()
         elif isinstance(var, MappedOperator):
@@ -700,6 +705,8 @@ class BaseSerialization:
             return NOTSET
         elif type_ == DAT.DEADLINE_ALERT:
             return decode_deadline_alert(var)
+        elif type_ == DAT.DAG_CALLBACK:
+            return decode_callback(var)
         else:
             raise TypeError(f"Invalid type {type_!s} in deserialization.")
 
@@ -1727,8 +1734,21 @@ class DagSerialization(BaseSerialization):
             # has_on_*_callback are only stored if the value is True, as the default is False
             if dag.has_on_success_callback:
                 serialized_dag["has_on_success_callback"] = True
+                callback_list = (
+                    dag.on_success_callback
+                    if isinstance(dag.on_success_callback, list)
+                    else [dag.on_success_callback]
+                )
+                serialized_dag["on_success_callback"] = [encode_callback(cb) for cb in callback_list]
+
             if dag.has_on_failure_callback:
                 serialized_dag["has_on_failure_callback"] = True
+                callback_list = (
+                    dag.on_failure_callback
+                    if isinstance(dag.on_failure_callback, list)
+                    else [dag.on_failure_callback]
+                )
+                serialized_dag["on_failure_callback"] = [encode_callback(cb) for cb in callback_list]
 
             # TODO: Move this logic to a better place -- ideally before serializing contents of default_args.
             #   There is some duplication with this and SerializedBaseOperator.partial_kwargs serialization.
@@ -1853,10 +1873,19 @@ class DagSerialization(BaseSerialization):
                 tg.add(task)
 
         # Set has_on_*_callbacks to True if they exist in Serialized blob as False is the default
+        # if "has_on_success_callback" in encoded_dag:
         if "has_on_success_callback" in encoded_dag:
             dag.has_on_success_callback = True
+            ser_success_callbacks: list[Callback] = []
+            for scb in encoded_dag.get("on_success_callback"):
+                ser_success_callbacks.append(decode_callback(scb))
+            dag.on_success_callback = ser_success_callbacks
         if "has_on_failure_callback" in encoded_dag:
             dag.has_on_failure_callback = True
+            ser_failure_callbacks: list[Callback] = []
+            for fcb in encoded_dag.get("on_failure_callback"):
+                ser_failure_callbacks.append(decode_callback(fcb))
+            dag.on_failure_callback = decode_callback(encoded_dag.get("on_failure_callback"))
 
         dag.deadline = encoded_dag.get("deadline")
 
@@ -2211,6 +2240,8 @@ class LazyDeserializedDAG(pydantic.BaseModel):
         "dag_display_name",
         "has_on_success_callback",
         "has_on_failure_callback",
+        "on_success_callback",
+        "on_failure_callback",
         "tags",
         # Attr properties that are nullable, or have a default that loads from config
         "description",

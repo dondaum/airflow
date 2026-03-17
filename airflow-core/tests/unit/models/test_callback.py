@@ -25,6 +25,7 @@ from airflow.models import Trigger
 from airflow.models.callback import (
     Callback,
     CallbackFetchMethod,
+    CallbackSource,
     CallbackState,
     ExecutorCallback,
     TriggererCallback,
@@ -74,19 +75,23 @@ class TestCallback:
         ("callback_def", "expected_cb_instance"),
         [
             pytest.param(
-                TEST_ASYNC_CALLBACK, TriggererCallback(callback_def=TEST_ASYNC_CALLBACK), id="triggerer"
+                TEST_ASYNC_CALLBACK,
+                TriggererCallback(callback_def=TEST_ASYNC_CALLBACK, callback_source=CallbackSource.DEADLINE),
+                id="triggerer",
             ),
             pytest.param(
                 TEST_SYNC_CALLBACK,
                 ExecutorCallback(
-                    callback_def=TEST_SYNC_CALLBACK, fetch_method=CallbackFetchMethod.IMPORT_PATH
+                    callback_def=TEST_SYNC_CALLBACK,
+                    fetch_method=CallbackFetchMethod.IMPORT_PATH,
+                    callback_source=CallbackSource.DEADLINE,
                 ),
                 id="executor",
             ),
         ],
     )
     def test_create_from_sdk_def(self, callback_def, expected_cb_instance):
-        returned_cb = Callback.create_from_sdk_def(callback_def)
+        returned_cb = Callback.create_from_sdk_def(callback_def, callback_source=CallbackSource.DEADLINE)
         assert isinstance(returned_cb, type(expected_cb_instance))
         assert returned_cb.data == expected_cb_instance.data
 
@@ -99,11 +104,19 @@ class TestCallback:
         unknown_callback = UnknownCallback()
 
         with pytest.raises(ValueError, match="Cannot handle Callback of type"):
-            Callback.create_from_sdk_def(unknown_callback)
+            Callback.create_from_sdk_def(unknown_callback, callback_source=CallbackSource.DEADLINE)
 
     def test_get_metric_info(self):
-        callback = TriggererCallback(TEST_ASYNC_CALLBACK, prefix="deadline_alerts", dag_id=TEST_DAG_ID)
-        callback.data["kwargs"] = {"context": {"dag_id": TEST_DAG_ID}, "email": "test@example.com"}
+        callback = TriggererCallback(
+            TEST_ASYNC_CALLBACK,
+            callback_source=CallbackSource.DEADLINE,
+            prefix="deadline_alerts",
+            dag_id=TEST_DAG_ID,
+        )
+        callback.data["callback"]["kwargs"] = {
+            "context": {"dag_id": TEST_DAG_ID},
+            "email": "test@example.com",
+        }
         metric_info = callback.get_metric_info(CallbackState.SUCCESS, "0")
 
         assert metric_info["stat"] == "deadline_alerts.callback_success"
@@ -111,21 +124,20 @@ class TestCallback:
             "result": "0",
             "path": TEST_ASYNC_CALLBACK.path,
             "kwargs": {"email": "test@example.com"},
-            "dag_id": TEST_DAG_ID,
         }
 
 
 class TestTriggererCallback:
     def test_polymorphic_serde(self, session):
         """Test that TriggererCallback can be serialized and deserialized"""
-        callback = TriggererCallback(TEST_ASYNC_CALLBACK)
+        callback = TriggererCallback(TEST_ASYNC_CALLBACK, callback_source=CallbackSource.DEADLINE)
         session.add(callback)
         session.commit()
 
         retrieved = session.scalar(select(Callback).where(Callback.id == callback.id))
         assert isinstance(retrieved, TriggererCallback)
         assert retrieved.fetch_method == CallbackFetchMethod.IMPORT_PATH
-        assert retrieved.data == TEST_ASYNC_CALLBACK.serialize()
+        assert retrieved.data["callback"] == TEST_ASYNC_CALLBACK.serialize()
         assert retrieved.state == CallbackState.SCHEDULED.value
         assert retrieved.output is None
         assert retrieved.priority_weight == 1
@@ -133,7 +145,7 @@ class TestTriggererCallback:
         assert retrieved.trigger_id is None
 
     def test_queue(self, session):
-        callback = TriggererCallback(TEST_ASYNC_CALLBACK)
+        callback = TriggererCallback(TEST_ASYNC_CALLBACK, callback_source=CallbackSource.DEADLINE)
         assert callback.state == CallbackState.SCHEDULED
         assert callback.trigger is None
 
@@ -170,7 +182,7 @@ class TestTriggererCallback:
         ],
     )
     def test_handle_event(self, session, event, terminal_state):
-        callback = TriggererCallback(TEST_ASYNC_CALLBACK)
+        callback = TriggererCallback(TEST_ASYNC_CALLBACK, callback_source=CallbackSource.DEADLINE)
         callback.queue()
         callback.handle_event(event, session)
 
@@ -188,14 +200,18 @@ class TestTriggererCallback:
 class TestExecutorCallback:
     def test_polymorphic_serde(self, session):
         """Test that ExecutorCallback can be serialized and deserialized"""
-        callback = ExecutorCallback(TEST_SYNC_CALLBACK, fetch_method=CallbackFetchMethod.IMPORT_PATH)
+        callback = ExecutorCallback(
+            TEST_SYNC_CALLBACK,
+            fetch_method=CallbackFetchMethod.IMPORT_PATH,
+            callback_source=CallbackSource.DEADLINE,
+        )
         session.add(callback)
         session.commit()
 
         retrieved = session.scalar(select(Callback).where(Callback.id == callback.id))
         assert isinstance(retrieved, ExecutorCallback)
         assert retrieved.fetch_method == CallbackFetchMethod.IMPORT_PATH
-        assert retrieved.data == TEST_SYNC_CALLBACK.serialize()
+        assert retrieved.data["callback"] == TEST_SYNC_CALLBACK.serialize()
         assert retrieved.state == CallbackState.SCHEDULED.value
         assert retrieved.output is None
         assert retrieved.priority_weight == 1
@@ -203,7 +219,11 @@ class TestExecutorCallback:
         assert retrieved.trigger_id is None
 
     def test_queue(self):
-        callback = ExecutorCallback(TEST_SYNC_CALLBACK, fetch_method=CallbackFetchMethod.DAG_ATTRIBUTE)
+        callback = ExecutorCallback(
+            TEST_SYNC_CALLBACK,
+            fetch_method=CallbackFetchMethod.DAG_ATTRIBUTE,
+            callback_source=CallbackSource.DEADLINE,
+        )
         assert callback.state == CallbackState.SCHEDULED
 
         callback.queue()

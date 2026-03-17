@@ -76,6 +76,7 @@ from airflow.sdk.definitions.asset import (
     AssetWatcher,
     BaseAsset,
 )
+from airflow.sdk.definitions.callback import SyncCallback
 from airflow.sdk.definitions.deadline import (
     AsyncCallback,
     DeadlineAlert,
@@ -303,6 +304,15 @@ def equal_serialized_deadline_alert(
     return a_ser == b_ser
 
 
+def equal_serialized_callbacks(a, b) -> bool:
+    """Compare callbacks for equality."""
+    print(a)
+    print(b)
+    print(str(a))
+    print(str(b))
+    return a == 1
+
+
 class MockLazySelectSequence(LazySelectSequence):
     _data = ["a", "b", "c"]
 
@@ -481,6 +491,11 @@ class MockLazySelectSequence(LazySelectSequence):
             ),
             DAT.DEADLINE_ALERT,
             equal_serialized_deadline_alert,
+        ),
+        (
+            SyncCallback("valid.callback.path", kwargs=None),
+            DAT.DAG_CALLBACK,
+            equal_serialized_callbacks,
         ),
     ],
 )

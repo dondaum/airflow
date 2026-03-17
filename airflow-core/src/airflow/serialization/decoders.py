@@ -169,6 +169,27 @@ def decode_deadline_alert(encoded_data: dict):
     )
 
 
+def decode_callback(encoded_data: dict):
+    """
+    Decode a previously serialized callback.
+
+    :meta private:
+    """
+    from airflow.sdk.serde import deserialize
+
+    data = encoded_data.get(Encoding.VAR, encoded_data)
+    # des_data = deserialize(data['callback'])
+    # print(des_data)
+    # print(type(des_data))
+    # return SerializedCallback(
+    #     path=des_data['callback']['__data__']['path'],
+    #     kwargs=des_data['callback']['__data__']['kwargs'],
+    #     executor=des_data['callback']['__data__']['executor'],
+    #     callback_type=des_data['__classname__'],
+    # )
+    return deserialize(data["callback"])
+
+
 def decode_timetable(var: dict[str, Any]) -> CoreTimetable:
     """
     Decode a previously serialized timetable.

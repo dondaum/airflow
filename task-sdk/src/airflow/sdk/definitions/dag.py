@@ -46,6 +46,7 @@ from airflow.sdk.bases.timetable import BaseTimetable
 from airflow.sdk.definitions._internal.node import validate_key
 from airflow.sdk.definitions._internal.types import NOTSET, ArgNotSet, is_arg_set
 from airflow.sdk.definitions.asset import AssetAll, BaseAsset
+from airflow.sdk.definitions.callback import Callback, SyncCallback
 from airflow.sdk.definitions.context import Context
 from airflow.sdk.definitions.deadline import DeadlineAlert
 from airflow.sdk.definitions.param import DagParam, ParamsDict
@@ -228,6 +229,28 @@ def _convert_deadline(deadline: list[DeadlineAlert] | DeadlineAlert | None) -> l
     if isinstance(deadline, DeadlineAlert):
         return [deadline]
     return list(deadline)
+
+
+def _convert_callback(
+    callback: None | DagStateChangeCallback | list[DagStateChangeCallback] | Callback | list[Callback],
+) -> list[Callback] | None:
+    """Convert on_success_callback and on_failure_callback parameter to a list of Callback objects."""
+    if callback is None:
+        return None
+    all_callbacks: list[Callback] = []
+    if isinstance(callback, Callback):
+        all_callbacks.append(callback)
+    elif callable(callback):
+        all_callbacks.append(SyncCallback(callback_callable=callback, kwargs=None, executor=None))
+    elif isinstance(callback, list):
+        for cb in callback:
+            if isinstance(cb, Callback):
+                all_callbacks.append(cb)
+            elif callable(cb):
+                all_callbacks.append(SyncCallback(callback_callable=cb, kwargs=None, executor=None))
+            else:
+                raise ValueError(f"Invalid callback type: {type(cb)}")
+    return all_callbacks
 
 
 def _convert_doc_md(doc_md: str | None) -> str | None:
@@ -501,8 +524,30 @@ class DAG:
     catchup: bool = attrs.field(
         factory=_config_bool_factory("scheduler", "catchup_by_default"),
     )
-    on_success_callback: None | DagStateChangeCallback | list[DagStateChangeCallback] = None
-    on_failure_callback: None | DagStateChangeCallback | list[DagStateChangeCallback] = None
+    on_success_callback: (
+        None | DagStateChangeCallback | list[DagStateChangeCallback] | Callback | list[Callback]
+    ) = attrs.field(
+        default=None,
+        converter=_convert_callback,
+        validator=attrs.validators.optional(
+            attrs.validators.deep_iterable(
+                member_validator=attrs.validators.instance_of((Callback, DagStateChangeCallback)),
+                iterable_validator=attrs.validators.instance_of(list),
+            )
+        ),
+    )
+    on_failure_callback: (
+        None | DagStateChangeCallback | list[DagStateChangeCallback] | Callback | list[Callback]
+    ) = attrs.field(
+        default=None,
+        converter=_convert_callback,
+        validator=attrs.validators.optional(
+            attrs.validators.deep_iterable(
+                member_validator=attrs.validators.instance_of((Callback, DagStateChangeCallback)),
+                iterable_validator=attrs.validators.instance_of(list),
+            )
+        ),
+    )
     doc_md: str | None = attrs.field(default=None, converter=_convert_doc_md)
     params: ParamsDict = attrs.field(
         # mypy doesn't really like passing the Converter object

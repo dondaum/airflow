@@ -72,7 +72,13 @@ from airflow.models.asset import (
     TaskOutletAssetReference,
 )
 from airflow.models.backfill import Backfill
-from airflow.models.callback import Callback, CallbackType, ExecutorCallback
+from airflow.models.callback import (
+    Callback,
+    CallbackFetchMethod,
+    CallbackSource,
+    CallbackType,
+    ExecutorCallback,
+)
 from airflow.models.dag import DagModel
 from airflow.models.dag_version import DagVersion
 from airflow.models.dagbag import DBDagBag
@@ -1052,8 +1058,23 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
             .limit(max_callbacks)
         ).all()
 
+        self.log.info("Getting all Callbacks")
+
+        all_callbacks = session.scalars(select(ExecutorCallback)).all()
+        for callback in all_callbacks:
+            self.log.info(callback.type)
+            self.log.info(callback.state)
+            self.log.info(callback.priority_weight)
+            self.log.info(callback.data)
+        self.log.info("Getting all Callbacks")
+        # self.log.info(all_callbacks)
+
         if not pending_callbacks:
+            self.log.info("No pending callbacks found")
             return
+
+        self.log.info("Pending callbacks found")
+        self.log.info(pending_callbacks)
 
         # Route callbacks to executors using the generalized routing method
         executor_to_callbacks = self._executor_to_workloads(pending_callbacks, session)
@@ -1068,7 +1089,10 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 # TODO: Add dagrun_id as a proper ORM foreign key on the callback table instead of storing in data dict.
                 #       This would eliminate this reconstruction step. For now, all ExecutorCallbacks
                 #       are expected to have dag_run_id set in their data dict (e.g., by Deadline.handle_miss).
-                if not isinstance(callback.data, dict) or "dag_run_id" not in callback.data:
+                if (
+                    not isinstance(callback.data["callback"], dict)
+                    or "dag_run_id" not in callback.data["callback"]
+                ):
                     self.log.error(
                         "ExecutorCallback %s is missing required 'dag_run_id' in data dict. "
                         "This indicates a bug in callback creation. Skipping callback.",
@@ -1076,7 +1100,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     )
                     continue
 
-                dag_run_id = callback.data["dag_run_id"]
+                dag_run_id = callback.data["callback"]["dag_run_id"]
                 dag_run = session.get(DagRun, dag_run_id)
 
                 if dag_run is None:
@@ -1492,8 +1516,13 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 if dag is not None:
                     dag_run.dag = dag
                     _, callback_to_run = dag_run.update_state(execute_callbacks=False, session=session)
+                    self.log.info("Sending Callback to run")
                     if callback_to_run:
-                        self._send_dag_callbacks_to_processor(dag, callback_to_run)
+                        self.log.info("Sending Callback to run")
+                        self.log.info(callback_to_run)
+                        self._send_dag_callbacks_to_processor(
+                            dag=dag, session=session, callback=callback_to_run
+                        )
         except Exception as e:  # should not fail the scheduler
             self.log.exception("Failed to update dag run state for paused dags due to %s", e)
 
@@ -1714,7 +1743,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
             dag = cached_get_dag(dag_run)
             if dag:
                 # Sending callbacks to the database, so it must be done outside of prohibit_commit.
-                self._send_dag_callbacks_to_processor(dag, callback_to_run)
+                self._send_dag_callbacks_to_processor(dag=dag, session=session, callback=callback_to_run)
             else:
                 self.log.error("DAG '%s' not found in serialized_dag table", dag_run.dag_id)
 
@@ -2368,12 +2397,82 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
     def _send_dag_callbacks_to_processor(
         self,
         dag: SerializedDAG,
+        session: Session,
         callback: DagCallbackRequest | None = None,
     ) -> None:
+        # TODO: Quick hack to translate old callback types to new ones. We can remove this once all callbacks are converted.
+        self.log.info("Changing Dag Callback Request to SyncCallback")
         if callback:
-            self.executor.send_callback(callback)
+            # Quick hack to translate old callback types to new ones. We can remove this once all callbacks are converted.
+            self.log.info("Changing Dag Callback Request to SyncCallback")
+
+            if callback.is_failure_callback:
+                self.log.info("Creating Dag Failure Callback")
+                all_cbs: list[ExecutorCallback] = []
+                for cb in dag.on_failure_callback:
+                    self.log.info("Adding callback: %s", cb)
+                    self.log.info(type(cb))
+                    new_callback = ExecutorCallback(
+                        callback_def=cb,
+                        fetch_method=CallbackFetchMethod.IMPORT_PATH,
+                        callback_source=CallbackSource.DAG,
+                    )
+                    new_callback.state = CallbackState.PENDING
+                    new_callback.data["callback"]["dag_run_id"] = callback.run_id
+                    new_callback.data["callback"]["dag_id"] = callback.dag_id
+                    all_cbs.append(new_callback)
+                self._persist_callbacks(callbacks=all_cbs)
+                self.log.info("Stored new callback request")
+            else:
+                self.log.info("Creating Dag Success Callback")
+                all_cbs: list[ExecutorCallback] = []
+                for cb in dag.on_success_callback:
+                    self.log.info("Adding callback: %s", cb)
+                    self.log.info(type(cb))
+                    new_callback = ExecutorCallback(
+                        callback_def=cb,
+                        fetch_method=CallbackFetchMethod.IMPORT_PATH,
+                        callback_source=CallbackSource.DAG,
+                    )
+                    new_callback.state = CallbackState.PENDING
+                    new_callback.data["callback"]["dag_run_id"] = callback.run_id
+                    new_callback.data["callback"]["dag_id"] = callback.dag_id
+                    all_cbs.append(new_callback)
+                self._persist_callbacks(callbacks=all_cbs)
+                self.log.info("Stored new callback request")
+            # elif isinstance(self.callback, ExecutorCallback):
+            #     if "kwargs" not in self.callback.data:
+            #         self.callback.data["kwargs"] = {}
+            #     self.callback.data["kwargs"] = (self.callback.data.get("kwargs") or {}) | {
+            #         "context": get_simple_context()
+            #     }
+            #     self.callback.data["deadline_id"] = str(self.id)
+            #     self.callback.data["dag_run_id"] = str(self.dagrun.id)
+            #     self.callback.data["dag_id"] = self.dagrun.dag_id
+
+            #     self.callback.state = CallbackState.PENDING
+            #     session.add(self.callback)
+            #     session.flush()
+
+            # new_callback = ExecutorCallback(
+            #     callback_def=1,
+            #     fetch_method=CallbackFetchMethod.DAG_ATTRIBUTE,
+            #     state=CallbackState.PENDING,
+
+            # )
+            # new_callback.data["dag_run_id"] = callback.run_id
+            # new_callback.data["dag_id"] = callback.dag_id
+            # session.add(new_callback)
+            # session.flush()
+            # self.executor.send_callback(callback)
         else:
             self.log.debug("callback is empty")
+
+    @provide_session
+    def _persist_callbacks(self, callbacks: list[ExecutorCallback], session: Session = NEW_SESSION) -> None:
+        """Store callbacks in a new session outside prohibit commit context."""
+        for callback in callbacks:
+            session.add(callback)
 
     @provide_session
     def _handle_tasks_stuck_in_queued(self, session: Session = NEW_SESSION) -> None:

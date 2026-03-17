@@ -26,6 +26,7 @@ import pytest
 
 from airflow.sdk import Context, Label, TaskGroup
 from airflow.sdk.bases.operator import BaseOperator
+from airflow.sdk.definitions.callback import Callback, SyncCallback
 from airflow.sdk.definitions.dag import DAG, dag as dag_decorator
 from airflow.sdk.definitions.param import DagParam, Param, ParamsDict
 from airflow.sdk.exceptions import AirflowDagCycleException, DuplicateTaskIdFound, RemovedInAirflow4Warning
@@ -477,6 +478,33 @@ class TestDag:
         )
         with pytest.raises(FailFastDagInvalidTriggerRule):
             fail_fast_dag.add_task(task_with_non_default_trigger_rule)
+
+    @pytest.mark.parametrize(
+        ("dag_callback_type", "use_callback_type"),
+        [
+            pytest.param("on_success_callback", False, id="on_success_callback"),
+            pytest.param("on_failure_callback", False, id="on_failure_callback"),
+        ],
+    )
+    def test_convert_py_callable_callback_to_callback(self, dag_callback_type, use_callback_type):
+        """Test that Python callables are transformed to a Callback."""
+
+        def do_something(context):
+            return context
+
+        if use_callback_type:
+            callback_input = {dag_callback_type: do_something}
+        else:
+            callback_input = {dag_callback_type: SyncCallback(callback_callable=do_something)}
+
+        with DAG("test_dag", schedule=None, start_date=DEFAULT_DATE, **callback_input) as dag:
+            pass
+
+        callback_attr = getattr(dag, dag_callback_type)
+
+        assert isinstance(callback_attr, list)
+        assert all(isinstance(cb, Callback) for cb in callback_attr)
+        assert callback_attr[0].path == f"{do_something.__module__}.{do_something.__qualname__}"
 
 
 # Test some of the arg validation. This is not all the validations we perform, just some of them.

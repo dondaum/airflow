@@ -66,6 +66,7 @@ class DagAttributeTypes(str, Enum):
     ARG_NOT_SET = "arg_not_set"
     TASK_CALLBACK_REQUEST = "task_callback_request"
     DAG_CALLBACK_REQUEST = "dag_callback_request"
+    DAG_CALLBACK = "dag_callback"
     TASK_INSTANCE_KEY = "task_instance_key"
     DEADLINE_ALERT = "deadline_alert"
     MAPPED_ARGUMENT = "mapped_argument"

@@ -62,6 +62,18 @@ def _accepts_context(callback: Callable) -> bool:
     return "context" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+class CallbackSource(str, Enum):
+    """
+    Source of Callbacks.
+
+    Used for figuring out what class to instantiate during deserialization.
+    """
+
+    DEADLINE = "deadline"
+    DAG = "dag"
+    TASK = "task"
+
+
 class CallbackType(str, Enum):
     """
     Types of Callbacks.
@@ -151,7 +163,7 @@ class Callback(Base, BaseWorkload):
         self.state = CallbackState.QUEUED
 
     def get_metric_info(self, status: CallbackState, result: Any) -> dict:
-        tags = {"result": result, **self.data}
+        tags = {"result": result, **self.data["callback"]}
         tags.pop("prefix", None)
 
         if "kwargs" in tags:
@@ -165,25 +177,33 @@ class Callback(Base, BaseWorkload):
 
     def get_dag_id(self) -> str | None:
         """Return the DAG ID for scheduler routing."""
-        return self.data.get("dag_id")
+        return self.data["callback"].get("dag_id")
 
     def get_executor_name(self) -> str | None:
         """Return the executor name for scheduler routing."""
-        return self.data.get("executor")
+        return self.data["callback"].get("executor")
 
     @staticmethod
-    def create_from_sdk_def(callback_def: CallbackDefinitionProtocol, **kwargs) -> Callback:
+    def create_from_sdk_def(
+        callback_def: CallbackDefinitionProtocol, callback_source: CallbackSource, **kwargs
+    ) -> Callback:
         # Cannot check actual type using isinstance() because that would require SDK import
+        # TODO: Quick hack to make poc work
         match type(callback_def).__name__:
             case "AsyncCallback":
                 if TYPE_CHECKING:
                     assert isinstance(callback_def, ImportPathCallbackDefProtocol)
-                return TriggererCallback(callback_def, **kwargs)
+                return TriggererCallback(callback_def, callback_source=callback_source, **kwargs)
 
             case "SyncCallback":
                 if TYPE_CHECKING:
                     assert isinstance(callback_def, ImportPathExecutorCallbackDefProtocol)
-                return ExecutorCallback(callback_def, fetch_method=CallbackFetchMethod.IMPORT_PATH, **kwargs)
+                return ExecutorCallback(
+                    callback_def,
+                    fetch_method=CallbackFetchMethod.IMPORT_PATH,
+                    callback_source=callback_source,
+                    **kwargs,
+                )
 
             case _:
                 raise ValueError(f"Cannot handle Callback of type {type(callback_def)}")
@@ -194,28 +214,32 @@ class TriggererCallback(Callback):
 
     __mapper_args__ = {"polymorphic_identity": CallbackType.TRIGGERER}
 
-    def __init__(self, callback_def: ImportPathCallbackDefProtocol, **kwargs):
+    def __init__(
+        self, callback_def: ImportPathCallbackDefProtocol, callback_source: CallbackSource, **kwargs
+    ):
         """
         Initialize a TriggererCallback from a callback definition.
 
         :param callback_def: Callback definition with path and kwargs
+        :param callback_source: Source of the callback
         :param kwargs: Passed to parent Callback.__init__ (see base class for details)
         """
         super().__init__(**kwargs)
         self.fetch_method = CallbackFetchMethod.IMPORT_PATH
-        self.data |= callback_def.serialize()
+        self.data |= {"source": callback_source, "callback": callback_def.serialize()}
 
     def __repr__(self):
-        return f"{self.data['path']}({self.data['kwargs'] or ''}) on a triggerer"
+        return f"{self.data['callback']['path']}({self.data['callback']['kwargs'] or ''}) on a triggerer"
 
     def queue(self):
         from airflow.models.trigger import Trigger
         from airflow.triggers.callback import CallbackTrigger
 
+        # TODO: Quick hack to make poc work
         self.trigger = Trigger.from_object(
             CallbackTrigger(
-                callback_path=self.data["path"],
-                callback_kwargs=self.data["kwargs"],
+                callback_path=self.data["callback"]["path"],
+                callback_kwargs=self.data["callback"]["kwargs"],
             )
         )
         super().queue()
@@ -241,21 +265,27 @@ class ExecutorCallback(Callback):
     __mapper_args__ = {"polymorphic_identity": CallbackType.EXECUTOR}
 
     def __init__(
-        self, callback_def: ImportPathExecutorCallbackDefProtocol, fetch_method: CallbackFetchMethod, **kwargs
+        self,
+        callback_def: ImportPathExecutorCallbackDefProtocol,
+        fetch_method: CallbackFetchMethod,
+        callback_source: CallbackSource,
+        **kwargs,
     ):
         """
         Initialize an ExecutorCallback from a callback definition and fetch method.
 
         :param callback_def: Callback definition with path, kwargs, and executor
+        :param callback_source: Source of the callback
         :param fetch_method: Method to fetch the callback at runtime
         :param kwargs: Passed to parent Callback.__init__ (see base class for details)
         """
         super().__init__(**kwargs)
         self.fetch_method = fetch_method
-        self.data |= callback_def.serialize()
+        # TODO: Quick hack to make poc work
+        self.data |= {"source": callback_source, "callback": callback_def.serialize()}
 
     def __repr__(self):
-        return f"{self.data['path']}({self.data['kwargs'] or ''}) on {self.data.get('executor', 'default')} executor"
+        return f"{self.data['callback']['path']}({self.data['callback']['kwargs'] or ''}) on {self.data.get('executor', 'default')} executor"
 
 
 class DagProcessorCallback(Callback):
