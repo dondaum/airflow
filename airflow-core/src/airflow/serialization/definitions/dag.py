@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
     from typing_extensions import TypeIs
 
+    from airflow.models.callback import CallbackDefinitionProtocol
     from airflow.models.taskinstance import TaskInstance
     from airflow.sdk import DAG
     from airflow.serialization.definitions.taskgroup import SerializedTaskGroup
@@ -116,6 +117,8 @@ class SerializedDAG:
     max_active_runs: int = 16
     max_active_tasks: int = 16
     max_consecutive_failed_dag_runs: int = 0
+    on_failure_callback: list[CallbackDefinitionProtocol] | None = None
+    on_success_callback: list[CallbackDefinitionProtocol] | None = None
     owner_links: dict[str, str] = attrs.field(factory=dict)
     params: SerializedParamsDict = attrs.field(factory=SerializedParamsDict)
     partial: bool = False

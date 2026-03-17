@@ -66,6 +66,8 @@ from airflow.sdk.definitions.callback import AsyncCallback
 from airflow.sdk.definitions.deadline import DeadlineAlert, DeadlineReference, VariableInterval
 from airflow.sdk.definitions.variable import Variable
 from airflow.sdk.exceptions import AirflowRuntimeError
+from airflow.sdk.definitions.callback import AsyncCallback, SyncCallback
+from airflow.models.callback import ExecutorCallback, CallbackFetchMethod
 from airflow.serialization.definitions.deadline import SerializedReferenceModels
 from airflow.serialization.serialized_objects import LazyDeserializedDAG
 from airflow.settings import get_policy_plugin_manager
@@ -127,6 +129,33 @@ def deadline_test_dag(session):
         return scheduler_dag
 
     return _make_dag
+
+
+def on_success(context):
+    """Test callback function for success scenarios."""
+    on_success.called = True
+    on_success.context_received = context
+
+
+def on_failure(context):
+    """Test callback function for failure scenarios."""
+    on_failure.called = True
+    on_failure.context_received = context
+
+
+on_success.called = False
+on_success.context_received = None
+on_failure.called = False
+on_failure.context_received = None
+
+
+@pytest.fixture
+def reset_callbacks():
+    """Reset callback states."""
+    on_success.called = False
+    on_success.context_received = None
+    on_failure.called = False
+    on_failure.context_received = None
 
 
 class TestDagRun:
@@ -542,13 +571,16 @@ class TestDagRun:
         assert callback is None
 
     def test_on_success_callback_when_task_skipped(self, session, testing_dag_bundle):
-        mock_on_success = mock.MagicMock()
-        mock_on_success.__name__ = "mock_on_success"
+        called = False
+
+        def on_success(context):
+            nonlocal called
+            called = True
 
         dag = DAG(
             dag_id="test_dagrun_update_state_with_handle_callback_success",
             start_date=datetime.datetime(2017, 1, 1),
-            on_success_callback=mock_on_success,
+            on_success_callback=on_success,
             schedule=datetime.timedelta(days=1),
         )
 
@@ -563,7 +595,7 @@ class TestDagRun:
         session.flush()
 
         scheduler_dag = sync_dag_to_db(dag, session=session)
-        scheduler_dag.on_success_callback = mock_on_success
+        scheduler_dag.on_success_callback = on_success
 
         initial_task_states = {
             "test_state_succeeded1": TaskInstanceState.SKIPPED,
@@ -575,7 +607,7 @@ class TestDagRun:
 
         assert task.state == TaskInstanceState.SKIPPED
         assert dag_run.state == DagRunState.SUCCESS
-        mock_on_success.assert_called_once()
+        assert called is True
 
     def test_dagrun_update_state_with_handle_callback_success(self, testing_dag_bundle, dag_maker, session):
         def on_success_callable(context):
@@ -624,6 +656,59 @@ class TestDagRun:
             msg="success",
         )
 
+    @conf_vars(
+        {
+            ("dag_processor", "run_callbacks"): "False",
+        }
+    )
+    def test_dagrun_update_state_with_handle_executor_callback_success(self, testing_dag_bundle, dag_maker, session, reset_callbacks):
+        relative_fileloc = "test_dagrun_update_state_with_handle_callback_success.py"
+        cb = SyncCallback(callback_callable=on_success)
+        with dag_maker(
+            dag_id="test_dagrun_update_state_with_handle_callback_success",
+            schedule=datetime.timedelta(days=1),
+            start_date=datetime.datetime(2017, 1, 1),
+            on_success_callback=cb,
+        ) as dag:
+            dag_task1 = EmptyOperator(task_id="test_state_succeeded1")
+            dag_task2 = EmptyOperator(task_id="test_state_succeeded2")
+            dag_task1.set_downstream(dag_task2)
+        dm = DagModel.get_dagmodel(dag.dag_id, session=session)
+        dm.relative_fileloc = relative_fileloc
+        session.merge(dm)
+        session.commit()
+
+        initial_task_states = {
+            "test_state_succeeded1": TaskInstanceState.SUCCESS,
+            "test_state_succeeded2": TaskInstanceState.SUCCESS,
+        }
+        dag.relative_fileloc = relative_fileloc
+        SerializedDagModel.write_dag(LazyDeserializedDAG.from_dag(dag), bundle_name="dag_maker")
+        session.commit()
+
+        dag_run = self.create_dag_run(dag=dag, task_states=initial_task_states, session=session)
+        dag_run.dag_model = dm
+
+        _, callback = dag_run.update_state(execute_callbacks=False)
+        assert dag_run.state == DagRunState.SUCCESS
+        assert len(callback) == 1
+        expected_callback = ExecutorCallback(
+            callback_def=cb,
+            fetch_method=CallbackFetchMethod.IMPORT_PATH,
+            dag_id="test_dagrun_update_state_with_handle_callback_success",
+            dag_run_id=dag_run.id,
+        )
+        expected_callback.data["kwargs"] = {
+            "context": DagRunContext(
+                dag_run=dag_run,
+                last_ti=dag_run.get_task_instance(task_id="test_state_succeeded2"),
+                is_failure_callback=False,
+                msg="success",
+            ),
+        }
+        assert callback[0].data == expected_callback.data
+        assert callback[0].data["kwargs"] == expected_callback.data["kwargs"]
+
     def test_dagrun_update_state_with_handle_callback_failure(self, testing_dag_bundle, dag_maker, session):
         def on_failure_callable(context):
             assert context["dag_run"].dag_id == "test_dagrun_update_state_with_handle_callback_failure"
@@ -671,6 +756,60 @@ class TestDagRun:
                 last_ti=dag_run.get_task_instance(task_id="test_state_failed2"),
             ),
         )
+
+    @conf_vars(
+        {
+            ("dag_processor", "run_callbacks"): "False",
+        }
+    )
+    def test_dagrun_update_state_with_handle_executor_callback_failure(self, testing_dag_bundle, dag_maker, session, reset_callbacks):
+        cb = SyncCallback(callback_callable=on_failure)
+
+        relative_fileloc = "test_dagrun_update_state_with_handle_callback_failure.py"
+        with dag_maker(
+            dag_id="test_dagrun_update_state_with_handle_callback_failure",
+            schedule=datetime.timedelta(days=1),
+            start_date=datetime.datetime(2017, 1, 1),
+            on_failure_callback=cb,
+        ) as dag:
+            dag_task1 = EmptyOperator(task_id="test_state_succeeded1")
+            dag_task2 = EmptyOperator(task_id="test_state_failed2")
+            dag_task1.set_downstream(dag_task2)
+        dm = DagModel.get_dagmodel(dag.dag_id, session=session)
+        dm.relative_fileloc = relative_fileloc
+        session.merge(dm)
+        session.commit()
+
+        initial_task_states = {
+            "test_state_succeeded1": TaskInstanceState.SUCCESS,
+            "test_state_failed2": TaskInstanceState.FAILED,
+        }
+        dag.relative_fileloc = relative_fileloc
+        SerializedDagModel.write_dag(LazyDeserializedDAG.from_dag(dag), bundle_name="dag_maker")
+        session.commit()
+
+        dag_run = self.create_dag_run(dag=dag, task_states=initial_task_states, session=session)
+        dag_run.dag_model = dm
+
+        _, callback = dag_run.update_state(execute_callbacks=False)
+        assert dag_run.state == DagRunState.FAILED
+        assert len(callback) == 1
+        expected_callback = ExecutorCallback(
+            callback_def=cb,
+            fetch_method=CallbackFetchMethod.IMPORT_PATH,
+            dag_id="test_dagrun_update_state_with_handle_callback_failure",
+            dag_run_id=dag_run.id,
+        )
+        expected_callback.data["kwargs"] = {
+            "context": DagRunContext(
+                dag_run=dag_run,
+                last_ti=dag_run.get_task_instance(task_id="test_state_failed2"),
+                is_failure_callback=True,
+                msg="task_failure",
+            ),
+        }
+        assert callback[0].data == expected_callback.data
+        assert callback[0].data["kwargs"] == expected_callback.data["kwargs"]
 
     def test_dagrun_set_state_end_date(self, dag_maker, session):
         with dag_maker(schedule=datetime.timedelta(days=1), start_date=DEFAULT_DATE):
@@ -3860,6 +3999,51 @@ class TestDagRunHandleDagCallback:
         assert "ts" in context_received
         assert "params" in context_received
 
+    # TODO: Find a better test name
+    @pytest.mark.parametrize(
+        ("success", "callback_func", "callback_attr", "expected_reason"),
+        [
+            (True, on_success, "on_success_callback", "test_success"),
+            (False, on_failure, "on_failure_callback", "test_failure"),
+        ],
+        ids=["success_callback", "failure_callback"],
+    )
+    def test_execute_dag_worker_callbacks(
+        self, dag_maker, session, success, callback_func, callback_attr, expected_reason, reset_callbacks
+    ):
+        """Test execute_dag_callbacks executes success/failure callback."""
+
+        callback = SyncCallback(callback_callable=callback_func)
+
+        dag_kwargs = {callback_attr: callback}
+        with dag_maker("test_dag", session=session, **dag_kwargs) as dag:
+            BashOperator(task_id="test_task", bash_command="echo 1")
+
+        dr = dag_maker.create_dagrun()
+
+        if success:
+            dag.on_success_callback = callback
+            dag.has_on_success_callback = True
+        else:
+            dag.on_failure_callback = callback
+            dag.has_on_failure_callback = True
+
+        dr.execute_dag_callbacks(
+            dag, success=success, relevant_ti=dr.get_task_instance("test_task"), reason=expected_reason
+        )
+
+        # Assert the callback was called
+        assert callback_func.called is True
+        assert callback_func.context_received is not None
+
+        # Should have RuntimeTaskInstance context with template variables
+        assert "dag_run" in callback_func.context_received
+        assert "logical_date" in callback_func.context_received
+        assert "reason" in callback_func.context_received
+        assert callback_func.context_received["reason"] == expected_reason
+        assert "ts" in callback_func.context_received
+        assert "params" in callback_func.context_received
+
     def test_execute_dag_callbacks_failure(self, dag_maker, session):
         """Test execute_dag_callbacks executes failure callback with RuntimeTaskInstance context"""
         called = False
@@ -3920,6 +4104,29 @@ class TestDagRunHandleDagCallback:
         )
 
         assert call_count == 2
+
+    # TODO: Find a better test name
+    def test_execute_dag_callbacks_multiple_worker_callbacks(self, dag_maker, session, reset_callbacks):
+        """Test execute_dag_callbacks executes multiple worker callbacks."""
+
+        callback_1 = SyncCallback(callback_callable=on_success)
+        callback_2 = SyncCallback(callback_callable=on_failure)
+
+        with dag_maker("test_dag", session=session, on_success_callback=[callback_1, callback_2]) as dag:
+            BashOperator(task_id="test_task", bash_command="echo 1")
+
+        dr = dag_maker.create_dagrun()
+
+        dag.on_success_callback = [callback_1, callback_2]
+        dag.has_on_success_callback = True
+
+        dr.execute_dag_callbacks(
+            dag, success=True, relevant_ti=dr.get_task_instance("test_task"), reason="test_success"
+        )
+
+        # Assert both callbacks were called
+        assert on_success.called is True
+        assert on_failure.called is True
 
     def test_execute_dag_callbacks_context_has_correct_ti_info(self, dag_maker, session):
         """Test execute_dag_callbacks context contains correct task instance information"""

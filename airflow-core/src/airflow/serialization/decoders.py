@@ -50,6 +50,11 @@ from airflow.serialization.helpers import (
 )
 
 if TYPE_CHECKING:
+    from airflow.models.callback import (
+        CallbackDefinitionProtocol,
+        ImportPathCallbackDefProtocol,
+        ImportPathExecutorCallbackDefProtocol,
+    )
     from airflow.partition_mappers.base import PartitionMapper
     from airflow.partition_mappers.window import Window
     from airflow.timetables.base import Timetable as CoreTimetable
@@ -194,6 +199,23 @@ def decode_deadline_alert(encoded_data: dict):
         callback=deserialize(data[DeadlineAlertFields.CALLBACK]),
         name=data.get(DeadlineAlertFields.NAME),
     )
+
+
+def decode_callback(encoded_data: dict) -> CallbackDefinitionProtocol:
+    """
+    Decode a previously serialized callback.
+
+    :meta private:
+    """
+    from airflow.sdk.serde import deserialize
+
+    data = encoded_data.get(Encoding.VAR, encoded_data)
+    ser_callback = deserialize(data["callback"])
+    if TYPE_CHECKING:
+        assert isinstance(
+            ser_callback, (ImportPathCallbackDefProtocol, ImportPathExecutorCallbackDefProtocol)
+        )
+    return ser_callback
 
 
 def decode_timetable(var: dict[str, Any]) -> CoreTimetable:

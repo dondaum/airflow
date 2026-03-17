@@ -98,10 +98,12 @@ class EmailRequest(BaseCallbackRequest):
 
 
 class DagRunContext(BaseModel):
-    """Class to pass context info from the server to build a Execution context object."""
+    """Class to pass context info from the server to build a Execution context object for a Callback."""
 
     dag_run: ti_datamodel.DagRun | None = None
     last_ti: ti_datamodel.TaskInstance | None = None
+    is_failure_callback: bool | None = None
+    msg: str | None = None
 
     @model_validator(mode="before")
     @classmethod

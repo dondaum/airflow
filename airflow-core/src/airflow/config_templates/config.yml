@@ -3062,6 +3062,24 @@ dag_processor:
       type: string
       example: ~
       default: "modified_time"
+    run_callbacks:
+      description: |
+        When ``True``, the dag_processor executes DAG callbacks and certain failed task callbacks (such as
+        ``on_success_callback`` and ``on_failure_callback``).
+        Set to ``False`` to disable this behavior if airflow workers or triggerers
+        will run callbacks instead. In this way the dag_processor will not need to share its resources
+        among Dag parsing and callback execution. Note: this only includes task callbacks which
+        do not currently run at the worker but on the dag_processor. This includes:
+        * Dag on_success_callback
+        * Dag on_failure_callback
+        * Triggerer Task on_success_callback
+        * Triggerer Task on_failure_callback
+        * Failed Task callbacks such as stucked task or externally killed tasks
+        * Email Request
+      version_added: 3.3.0
+      type: boolean
+      example: ~
+      default: "True"
     max_callbacks_per_loop:
       description: |
         The maximum number of callbacks that are fetched during a single loop.

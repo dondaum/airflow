@@ -66,6 +66,14 @@ ACTIVE_STATES = frozenset((CallbackState.PENDING, CallbackState.QUEUED, Callback
 TERMINAL_STATES = frozenset((CallbackState.SUCCESS, CallbackState.FAILED))
 
 
+class CallbackSource(str, Enum):
+    """Where/why this callback was triggered."""
+
+    DEADLINE = "deadline"
+    DAG = "dag"
+    TASK = "task" 
+
+
 class CallbackType(str, Enum):
     """
     Types of Callbacks.

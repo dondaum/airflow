@@ -1158,8 +1158,23 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
             .limit(max_callbacks)
         ).all()
 
+        # self.log.info("Getting all Callbacks")
+
+        all_callbacks = session.scalars(select(ExecutorCallback)).all()
+        # for callback in all_callbacks:
+        #     self.log.info(callback.type)
+        #     self.log.info(callback.state)
+        #     self.log.info(callback.priority_weight)
+        #     self.log.info(callback.data)
+        # self.log.info("Getting all Callbacks")
+        # self.log.info(all_callbacks)
+
         if not pending_callbacks:
+            self.log.info("No pending callbacks found")
             return
+
+        # self.log.info("Pending callbacks found")
+        # self.log.info(pending_callbacks)
 
         # Route callbacks to executors using the generalized routing method
         executor_to_callbacks = self._executor_to_workloads(pending_callbacks, session)
@@ -1167,6 +1182,8 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         # Enqueue callbacks for each executor
         for executor, callbacks in executor_to_callbacks.items():
             for callback in callbacks:
+                # self.log.info(type(callback))
+                # self.log.info(callback)
                 if not isinstance(callback, ExecutorCallback):
                     # Can't happen since we queried ExecutorCallback, but satisfies mypy.
                     continue
@@ -1185,6 +1202,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 dag_run_id = callback.data["dag_run_id"]
                 dag_run = session.get(DagRun, dag_run_id)
 
+                # TODO: Can there be zombi callbacks as before callbacks are pruned / cleaned up in context of deadlines ?
                 if dag_run is None:
                     self.log.warning(
                         "Could not find DagRun with id=%s for callback %s. DagRun may have been deleted.",
@@ -1198,6 +1216,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     dag_run=dag_run,
                     generator=executor.jwt_generator,
                 )
+                self.log.info(workload)
 
                 executor.queue_workload(workload, session=session)
                 callback.state = CallbackState.QUEUED
@@ -1626,8 +1645,11 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 if dag is not None:
                     dag_run.dag = dag
                     _, callback_to_run = dag_run.update_state(execute_callbacks=False, session=session)
+                    self.log.info("Sending Callback to run")
                     if callback_to_run:
-                        self._send_dag_callbacks_to_processor(dag, callback_to_run)
+                        self.log.info("Sending Callback to run")
+                        self.log.info(callback_to_run)
+                        self._send_dag_callbacks_to_processor_or_executor(dag, callback_to_run)
         except Exception as e:  # should not fail the scheduler
             self.log.exception("Failed to update dag run state for paused dags due to %s", e)
 
@@ -1884,7 +1906,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
             dag = cached_get_dag(dag_run)
             if dag:
                 # Sending callbacks to the database, so it must be done outside of prohibit_commit.
-                self._send_dag_callbacks_to_processor(dag, callback_to_run)
+                self._send_dag_callbacks_to_processor_or_executor(dag, callback_to_run)
             else:
                 self.log.error("DAG '%s' not found in serialized_dag table", dag_run.dag_id)
 
@@ -2695,7 +2717,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         guard: CommitProhibitorGuard,
         dag_runs: Iterable[DagRun],
         session: Session,
-    ) -> list[tuple[DagRun, DagCallbackRequest | None]]:
+    ) -> list[tuple[DagRun, DagCallbackRequest | list[Callback] | None]]:
         """Make scheduling decisions for all `dag_runs`."""
         callback_tuples = []
         for run in dag_runs:
@@ -2713,14 +2735,14 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         self,
         dag_run: DagRun,
         session: Session,
-    ) -> DagCallbackRequest | None:
+    ) -> DagCallbackRequest | list[Callback] | None:
         """
         Make scheduling decisions about an individual dag run.
 
         :param dag_run: The DagRun to schedule
         :return: Callback that needs to be executed
         """
-        callback: DagCallbackRequest | None = None
+        callback: DagCallbackRequest | list[Callback] | None = None
 
         dag = dag_run.dag = self.scheduler_dag_bag.get_dag_for_run(dag_run=dag_run, session=session)
         dag_model = DM.get_dagmodel(dag_run.dag_id, session=session)
@@ -2872,15 +2894,35 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
 
         return True
 
-    def _send_dag_callbacks_to_processor(
+    def _send_dag_callbacks_to_processor_or_executor(
         self,
         dag: SerializedDAG,
-        callback: DagCallbackRequest | None = None,
+        callback: DagCallbackRequest | list[Callback] | None = None,
     ) -> None:
+        """Send callbacks to processor or executor based on configuration."""
         if callback:
-            self.executor.send_callback(callback)
+            if not conf.getboolean("dag_processor", "run_callbacks"):
+                if isinstance(callback, DagCallbackRequest):
+                    raise ValueError("Expected list of Callback not DagCallbackRequest")
+                self._persist_callbacks(callbacks=callback)
+            else:
+                if isinstance(callback, DagCallbackRequest):
+                    self.executor.send_callback(callback)
+                else:
+                    raise ValueError("Expected DagCallbackRequest")
         else:
             self.log.debug("callback is empty")
+
+    # TODO: Is this needed ? Can't we just use session.add() in _send_dag_callbacks_to_processor_or_executor() ?
+    @provide_session
+    def _persist_callbacks(self, callbacks: list[Callback], session: Session = NEW_SESSION) -> None:
+        """Store callbacks in a new session outside prohibit commit context."""
+        for callback in callbacks:
+            if isinstance(callback, ExecutorCallback):
+                callback.state = CallbackState.PENDING
+                session.add(callback)
+            else:
+                raise ValueError(f"Unsupported callback type: {type(callback)}")
 
     @provide_session
     def _handle_tasks_stuck_in_queued(self, *, session: Session = NEW_SESSION) -> None:

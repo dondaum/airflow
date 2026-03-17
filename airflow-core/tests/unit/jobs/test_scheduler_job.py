@@ -24,7 +24,7 @@ import os
 import re
 from collections import Counter, deque
 from collections.abc import Callable, Generator, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -4118,7 +4118,7 @@ class TestSchedulerJob:
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job)
 
-        self.job_runner._send_dag_callbacks_to_processor = mock.Mock()
+        self.job_runner._send_dag_callbacks_to_processor_or_executor = mock.Mock()
         self.job_runner._schedule_dag_run = mock.Mock()
 
         dr = dag_maker.create_dagrun()
@@ -4134,19 +4134,19 @@ class TestSchedulerJob:
                 mock_guard.reset_mock()
                 return None
 
-            def mock_send_dag_callbacks_to_processor(*args, **kwargs):
+            def mock_send_dag_callbacks_to_processor_or_executor(*args, **kwargs):
                 mock_guard.return_value.__enter__.return_value.commit.assert_called()
 
-            self.job_runner._send_dag_callbacks_to_processor.side_effect = (
-                mock_send_dag_callbacks_to_processor
+            self.job_runner._send_dag_callbacks_to_processor_or_executor.side_effect = (
+                mock_send_dag_callbacks_to_processor_or_executor
             )
             self.job_runner._schedule_dag_run.side_effect = mock_schedule_dag_run
 
             self.job_runner._do_scheduling(session)
 
         # Verify dag failure callback request is sent to file processor
-        self.job_runner._send_dag_callbacks_to_processor.assert_called_once()
-        # and mock_send_dag_callbacks_to_processor has asserted the callback was sent after a commit
+        self.job_runner._send_dag_callbacks_to_processor_or_executor.assert_called_once()
+        # and mock_send_dag_callbacks_to_processor_or_executor has asserted the callback was sent after a commit
 
         session.rollback()
         session.close()
@@ -4166,7 +4166,7 @@ class TestSchedulerJob:
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job)
 
-        self.job_runner._send_dag_callbacks_to_processor = mock.Mock()
+        self.job_runner._send_dag_callbacks_to_processor_or_executor = mock.Mock()
 
         dr = dag_maker.create_dagrun()
         ti = dr.get_task_instance("test_task", session=session)
@@ -4175,8 +4175,9 @@ class TestSchedulerJob:
         self.job_runner._do_scheduling(session)
 
         # Verify Callback is not set (i.e is None) when no callbacks are set on DAG
-        self.job_runner._send_dag_callbacks_to_processor.assert_called_once()
-        call_args = self.job_runner._send_dag_callbacks_to_processor.call_args.args
+        self.job_runner._send_dag_callbacks_to_processor_or_executor.assert_called_once()
+        call_args = self.job_runner._send_dag_callbacks_to_processor_or_executor.call_args.args
+        print(call_args)
         assert call_args[0].dag_id == dr.dag_id
         assert call_args[1] is None
 
@@ -4198,7 +4199,7 @@ class TestSchedulerJob:
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(job=scheduler_job)
 
-        self.job_runner._send_dag_callbacks_to_processor = mock.Mock()
+        self.job_runner._send_dag_callbacks_to_processor_or_executor = mock.Mock()
 
         session = settings.Session()
         dr = dag_maker.create_dagrun()
@@ -4208,13 +4209,85 @@ class TestSchedulerJob:
         self.job_runner._do_scheduling(session)
 
         # Verify Callback is set (i.e is None) when no callbacks are set on DAG
-        self.job_runner._send_dag_callbacks_to_processor.assert_called_once()
-        call_args = self.job_runner._send_dag_callbacks_to_processor.call_args.args
+        self.job_runner._send_dag_callbacks_to_processor_or_executor.assert_called_once()
+        call_args = self.job_runner._send_dag_callbacks_to_processor_or_executor.call_args.args
         assert call_args[0].dag_id == dr.dag_id
         assert call_args[1] is not None
         assert call_args[1].msg == msg
         session.rollback()
         session.close()
+
+    @pytest.mark.parametrize(
+        ("cb_request", "dag_processor_run_callbacks", "expectation"),
+        [
+            [
+                DagCallbackRequest(
+                    filepath="some/path",
+                    dag_id="dag_id",
+                    run_id="run_id",
+                    bundle_name="bundle_name",
+                    bundle_version="bundle_version",
+                ),
+                "True",
+                nullcontext(),
+            ],
+            [
+                DagCallbackRequest(
+                    filepath="some/path",
+                    dag_id="dag_id",
+                    run_id="run_id",
+                    bundle_name="bundle_name",
+                    bundle_version="bundle_version",
+                ),
+                "False",
+                pytest.raises(ValueError, match="Expected list of Callback not DagCallbackRequest"),
+            ],
+        ],
+        ids=["dag_processor_callback", "dag_processor_callback_with_executor_target"],
+    )
+    def test_dag_callbacks_are_send_to_dag_processor(
+        self, cb_request, dag_processor_run_callbacks, expectation
+    ):
+        """
+        Test if callbacks are sent to the right place (processor or executor) based on the configuration and callback type
+        """
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
+
+        with conf_vars({("dag_processor", "run_callbacks"): dag_processor_run_callbacks}):
+            with expectation:
+                self.job_runner._send_dag_callbacks_to_processor_or_executor(mock.Mock(), cb_request)
+                if bool(dag_processor_run_callbacks):
+                    self.null_exec.callback_sink.send.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("cb_request", "dag_processor_run_callbacks", "expectation"),
+        [
+            [[SyncCallback("some.path")], "False", nullcontext()],
+            [
+                [SyncCallback("some.path")],
+                "True",
+                pytest.raises(ValueError, match="Expected DagCallbackRequest"),
+            ],
+        ],
+        ids=["executor_callback", "executor_callback_with_dag_processor_target"],
+    )
+    def test_dag_callbacks_are_send_to_executor(self, cb_request, dag_processor_run_callbacks, expectation):
+        """
+        Test if callbacks are sent to the right place (processor or executor) based on the configuration and callback type
+        """
+
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(job=scheduler_job, executors=[self.null_exec])
+        mock_persit_callback = mock.Mock()
+        self.job_runner._persist_callbacks = mock_persit_callback
+
+        with conf_vars({("dag_processor", "run_callbacks"): dag_processor_run_callbacks}):
+            with expectation:
+                self.job_runner._send_dag_callbacks_to_processor_or_executor(mock.Mock(), cb_request)
+                if not bool(dag_processor_run_callbacks):
+                    mock_persit_callback._persist_callbacks.assert_called_once()
 
     @conf_vars({("scheduler", "use_job_schedule"): "False"})
     def test_dagrun_notify_called_success(self, dag_maker, listener_manager):

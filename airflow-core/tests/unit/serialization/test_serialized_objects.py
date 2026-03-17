@@ -75,6 +75,7 @@ from airflow.sdk.definitions.asset import (
     AssetWatcher,
     BaseAsset,
 )
+from airflow.sdk.definitions.callback import SyncCallback
 from airflow.sdk.definitions.deadline import (
     AsyncCallback,
     DeadlineAlert,
@@ -456,6 +457,16 @@ class MockLazySelectSequence(LazySelectSequence):
             ),
             DAT.DEADLINE_ALERT,
             equal_serialized_deadline_alert,
+        ),
+        (
+            SyncCallback("valid.callback.path", kwargs=None),
+            DAT.DAG_CALLBACK,
+            equals,
+        ),
+        (
+            AsyncCallback("valid.callback.path", kwargs={"arg1": "value1"}),
+            DAT.DAG_CALLBACK,
+            equals,
         ),
     ],
 )
